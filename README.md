@@ -56,6 +56,18 @@ request in each consuming repository, gated by that repository's own pipeline.
 The trade-off is honest: updates are not instant. For a security control that is the right
 side to err on.
 
+## A note on severity gates
+
+Two scanners, two conventions, both of which silently defeat a naive gate:
+
+* **Semgrep** emits no per-result `level` — the severity is on the rule descriptor. Reading
+  `result.level` sees `None` for every finding and passes everything.
+* **OSV-Scanner** marks *every* result `warning` regardless of how serious the advisory is;
+  the real severity is a CVSS score in the rule's `security-severity` property. Its own
+  `--fail-on-vuln` flag is all-or-nothing.
+
+`security/gate_sarif.py` handles both, and is tested against real output from each.
+
 ## Adopting it
 
 See [`docs/ADOPTING.md`](docs/ADOPTING.md). Roughly: copy four files from
