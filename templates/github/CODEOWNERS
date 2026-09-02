@@ -1,0 +1,21 @@
+# Branch protection must have "Require review from Code Owners" enabled for this to bind,
+# and each team needs at least Write access to this repository. GitHub silently ignores an
+# entry whose team has no access - the control fails open with no error anywhere.
+#
+# Every protected path has two owning teams on purpose: a pull request author never
+# satisfies their own Code Owner review, so a single-team path stalls whenever that team
+# is the author.
+
+*                           @neotree/core-devs
+
+/security/                  @neotree/core-devs @neotree/maintainers
+/.github/workflows/         @neotree/core-devs @neotree/maintainers
+/.github/actions/           @neotree/core-devs @neotree/maintainers
+/.npmrc                     @neotree/core-devs @neotree/maintainers
+/.yarnrc                    @neotree/core-devs @neotree/maintainers
+/.yarnrc.yml                @neotree/core-devs @neotree/maintainers
+/.pnpmfile.cjs              @neotree/core-devs @neotree/maintainers
+
+/.github/CODEOWNERS         @neotree/maintainers @neotree/core-devs
+/.github/dependabot.yml     @neotree/maintainers @neotree/core-devs
+/SECURITY.md                @neotree/maintainers @neotree/core-devs

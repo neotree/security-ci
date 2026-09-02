@@ -1,0 +1,197 @@
+name: Scheduled Security Scan (reusable)
+
+# Re-scans the calling repository on a schedule. Advisory databases, CodeQL queries and
+# campaign intelligence all change after a pull request merges, so a repository that was
+# clean at merge time is not necessarily clean today.
+on:
+  workflow_call:
+    inputs:
+      security-ci-ref:
+        description: Pinned neotree/security-ci commit SHA. Must match the caller's `uses:`.
+        type: string
+        required: true
+      policy-overlay:
+        type: string
+        default: security/policy.json
+      gitleaks-ignore:
+        type: string
+        default: security/gitleaks-ignore.txt
+      enable-codeql:
+        type: boolean
+        default: true
+      enable-all-branch-scan:
+        type: boolean
+        default: true
+      upload-sarif:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  repository-policy:
+    name: Scheduled Malware/Policy Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Repository malware and policy scan
+        shell: bash
+        env:
+          OVERLAY: ${{ inputs.policy-overlay }}
+        run: |
+          set -Eeuo pipefail
+          args=(--root repo --policy scanner/security/policy.defaults.json
+                --iocs scanner/security/polinrider_iocs.json
+                --report reports/scheduled-security-report.json
+                --sarif reports/scheduled-security-report.sarif)
+          if [ -f "repo/${OVERLAY}" ]; then args+=(--policy-overlay "repo/${OVERLAY}"); fi
+          python3 scanner/security/scan_repo.py "${args[@]}"
+      - name: Upload findings to code scanning
+        if: ${{ always() && inputs.upload-sarif }}
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: reports/scheduled-security-report.sarif
+          category: repo-policy-scanner
+      - name: Upload scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scheduled-policy-report
+          path: reports/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  all-branches:
+    name: All-Branch Malware Scan
+    # A pull-request gate only ever sees the branch being merged. The reported "commit
+    # twin" technique force-pushes infected commits across many branches at once, so a
+    # payload can sit on a stale branch indefinitely, one `git checkout` from a developer.
+    if: ${{ inputs.enable-all-branch-scan }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Scan every remote branch
+        env:
+          TARGET_REPO: repo
+          POLICY_OVERLAY: ${{ inputs.policy-overlay }}
+        run: ./scanner/security/scan_all_branches.sh
+
+  gitleaks:
+    name: Scheduled Secret History Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Gitleaks full Git history scan
+        shell: bash
+        env:
+          IGNORE_PATH: ${{ inputs.gitleaks-ignore }}
+        run: |
+          set -Eeuo pipefail
+          IGNORE="scanner/security/empty-gitleaks-ignore.txt"
+          if [ -f "repo/${IGNORE_PATH}" ]; then IGNORE="repo/${IGNORE_PATH}"; fi
+          BIN="$(./scanner/security/install_gitleaks.sh)"
+          "${BIN}" git --config scanner/security/gitleaks.toml \
+            --redact --no-banner --ignore-gitleaks-allow \
+            --gitleaks-ignore-path "${IGNORE}" \
+            --max-decode-depth 3 --max-archive-depth 2 repo
+
+  codeql:
+    name: Scheduled CodeQL (${{ matrix.language }})
+    if: ${{ inputs.enable-codeql }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9

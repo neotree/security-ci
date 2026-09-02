@@ -1,0 +1,2 @@
+# Deliberately contains no vulnerability ignores. CI passes this file explicitly so
+# a PR cannot add a root-level OSV configuration that suppresses a finding.

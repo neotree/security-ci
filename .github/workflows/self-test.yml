@@ -1,0 +1,68 @@
+name: Self Test
+
+# The pipeline's own CI. A change that breaks detection must fail here, loudly, rather
+# than silently stop detecting in six downstream repositories.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Scanner tests + self-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scanner regression tests
+        run: python3 -m unittest discover -s security/tests -t . -v
+      - name: Byte-compile every module
+        run: python3 -m compileall -q security/
+      - name: Lint workflows (pinned binary + checksum)
+        run: |
+          set -Eeuo pipefail
+          ACTIONLINT="$(./security/install_actionlint.sh)"
+          "${ACTIONLINT}" -color .github/workflows/*.yml
+      - name: Lint shell scripts
+        run: shellcheck --severity=warning security/*.sh
+      - name: Scan this repository with its own scanner
+        run: python3 security/scan_repo.py --root .
+      - name: Verify every Action reference is a pinned 40-character SHA
+        # Parsed rather than grepped: a grep for "uses: " matches its own pattern when the
+        # workflow file containing it is one of the files being scanned.
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          bad = []
+          roots = [pathlib.Path(".github/workflows"), pathlib.Path("templates/workflows")]
+          for root in roots:
+              for path in sorted(root.glob("*.yml")):
+                  for m in re.finditer(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*$", path.read_text(), re.M):
+                      ref = m.group(1)
+                      if ref.startswith("./"):
+                          continue
+                      sha = ref.rsplit("@", 1)[-1] if "@" in ref else ""
+                      if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                          bad.append(f"{path}: {ref}")
+          for b in bad:
+              print(f"::error::Unpinned action reference: {b}")
+          print(f"{len(bad)} unpinned reference(s).")
+          sys.exit(1 if bad else 0)
+          PY

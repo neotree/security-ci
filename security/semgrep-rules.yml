@@ -1,0 +1,67 @@
+# Deterministic, offline SAST rules.
+#
+# Severity contract: the CI job blocks on ERROR only. WARNING rules are reported
+# as annotations so risky-but-legitimate patterns stay visible without making the
+# gate unattainable. Console hygiene is intentionally NOT duplicated here; the
+# custom scanner owns that rule so there is a single configurable source of truth.
+rules:
+  - id: js-ts-dynamic-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Dynamic code execution is forbidden.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+    paths:
+      exclude:
+        # Mirrors the reviewed, expiring exception in security/policy.json.
+        # Remove from BOTH places when the sandboxed evaluator lands.
+        # Leading slash anchors to the scan root (Semgrepignore v2 semantics).
+        - "/app/(ops)/conditional-exp/_eval.ts"
+
+  - id: js-ts-unsafe-raw-sql-template
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Potential SQL injection. Use a parameterized query instead of interpolated SQL.
+    pattern-either:
+      - pattern: $DB.query(`...${$X}...`)
+      - pattern: $DB.execute(`...${$X}...`)
+      - pattern: $DB.raw(`...${$X}...`)
+      - pattern: $DB.$queryRawUnsafe(...)
+      - pattern: $DB.$executeRawUnsafe(...)
+      - pattern: $DB.query($A + $B)
+      - pattern: $DB.execute($A + $B)
+
+  - id: js-ts-child-process-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Shell/process execution from application code requires a security redesign/review.
+    pattern-either:
+      - pattern: require('child_process').exec(...)
+      - pattern: require('child_process').execSync(...)
+      - pattern: require('child_process').spawn(...)
+      - pattern: require('node:child_process').exec(...)
+      - pattern: require('node:child_process').execSync(...)
+      - pattern: require('node:child_process').spawn(...)
+
+  - id: node-disable-tls-verification
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: TLS certificate verification must not be disabled.
+    pattern-either:
+      - pattern: '{..., rejectUnauthorized: false, ...}'
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+
+  - id: react-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      dangerouslySetInnerHTML bypasses React's XSS escaping. Confirm the value is
+      sanitized (or statically trusted) before it reaches this component.
+    pattern: <$X ... dangerouslySetInnerHTML=$Y ... />
+
+  - id: js-dom-innerhtml-assignment
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Direct innerHTML assignment is an XSS risk; prefer textContent or a sanitizing helper.
+    pattern: $EL.innerHTML = $X

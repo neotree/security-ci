@@ -1,0 +1,491 @@
+name: Security CI (reusable)
+
+# Reusable unprivileged pipeline. The caller supplies the triggers
+# (pull_request / merge_group / push); this workflow does the work.
+#
+# The scanner always comes from neotree/security-ci at the pinned SHA, never from the
+# repository under test. Each repository supplies only its own policy overlay, which may
+# tighten the gate but never loosen it.
+on:
+  workflow_call:
+    inputs:
+      security-ci-ref:
+        description: Pinned neotree/security-ci commit SHA. Must match the caller's `uses:`.
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: "22"
+      policy-overlay:
+        description: Path, in the calling repository, to its policy overlay.
+        type: string
+        default: security/policy.json
+      gitleaks-ignore:
+        description: Path, in the calling repository, to its Gitleaks fingerprint file.
+        type: string
+        default: security/gitleaks-ignore.txt
+      enable-codeql:
+        type: boolean
+        default: true
+      enable-dependency-review:
+        type: boolean
+        default: true
+      enable-quality:
+        description: Install dependencies and run audit/lint/typecheck/test/build.
+        type: boolean
+        default: true
+      upload-sarif:
+        description: Disable for private repositories without code scanning.
+        type: boolean
+        default: true
+      extra-egress-endpoints:
+        description: Newline-separated extra hosts the project's install/build needs.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  static-policy:
+    name: Static Policy
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - name: Checkout repository under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Checkout pinned scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Scanner regression tests
+        working-directory: scanner
+        run: python3 -m unittest discover -s security/tests -t . -v
+      - name: Repository malware and policy scan
+        shell: bash
+        env:
+          OVERLAY: ${{ inputs.policy-overlay }}
+        run: |
+          set -Eeuo pipefail
+          args=(--root repo
+                --policy scanner/security/policy.defaults.json
+                --iocs scanner/security/polinrider_iocs.json
+                --report reports/security-report.json
+                --sarif reports/security-report.sarif)
+          if [ -f "repo/${OVERLAY}" ]; then args+=(--policy-overlay "repo/${OVERLAY}"); fi
+          python3 scanner/security/scan_repo.py "${args[@]}"
+      - name: Upload findings to code scanning
+        if: ${{ always() && inputs.upload-sarif && github.event.pull_request.head.repo.fork != true }}
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: reports/security-report.sarif
+          category: repo-policy-scanner
+      - name: Upload scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: static-policy-report
+          path: reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  quality:
+    name: Dependencies + Quality + Tests + Build
+    if: ${{ inputs.enable-quality && github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      CI: "true"
+      NODE_ENV: test
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+      YARN_ENABLE_SCRIPTS: "false"
+      PNPM_ENABLE_PRE_POST_SCRIPTS: "false"
+      HUSKY: "0"
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            nodejs.org:443
+            registry.npmjs.org:443
+            registry.yarnpkg.com:443
+            ${{ inputs.extra-egress-endpoints }}
+      - name: Checkout repository under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Checkout pinned scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Re-check policy before project execution
+        shell: bash
+        env:
+          OVERLAY: ${{ inputs.policy-overlay }}
+        run: |
+          set -Eeuo pipefail
+          args=(--root repo --policy scanner/security/policy.defaults.json
+                --iocs scanner/security/polinrider_iocs.json)
+          if [ -f "repo/${OVERLAY}" ]; then args+=(--policy-overlay "repo/${OVERLAY}"); fi
+          python3 scanner/security/scan_repo.py "${args[@]}"
+      - name: Install safely, audit, lint, typecheck, test and build
+        env:
+          SECURITY_POLICY_DEFAULTS: ${{ github.workspace }}/scanner/security/policy.defaults.json
+          SECURITY_POLICY_OVERLAY: ${{ github.workspace }}/repo/${{ inputs.policy-overlay }}
+        run: python3 scanner/security/run_project_checks.py --repo repo
+      - name: Detect build-time/source injection after project scripts
+        shell: bash
+        env:
+          OVERLAY: ${{ inputs.policy-overlay }}
+        run: |
+          set -Eeuo pipefail
+          args=(--root repo --policy scanner/security/policy.defaults.json
+                --iocs scanner/security/polinrider_iocs.json
+                --report reports/post-build-security-report.json)
+          if [ -f "repo/${OVERLAY}" ]; then args+=(--policy-overlay "repo/${OVERLAY}"); fi
+          python3 scanner/security/scan_repo.py "${args[@]}"
+      - name: Upload post-build scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: post-build-report
+          path: reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  gitleaks:
+    name: Secret Scan
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - name: Checkout repository under test (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Checkout pinned scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Gitleaks full Git history scan (pinned binary + checksum)
+        shell: bash
+        env:
+          IGNORE_PATH: ${{ inputs.gitleaks-ignore }}
+        run: |
+          set -Eeuo pipefail
+          # Trusted config from security-ci; acknowledged fingerprints from the repo itself,
+          # because a leak and its remediation are inherently repository-specific.
+          IGNORE="scanner/security/empty-gitleaks-ignore.txt"
+          if [ -f "repo/${IGNORE_PATH}" ]; then IGNORE="repo/${IGNORE_PATH}"; fi
+          BIN="$(./scanner/security/install_gitleaks.sh)"
+          "${BIN}" git \
+            --config scanner/security/gitleaks.toml \
+            --redact --no-banner --ignore-gitleaks-allow \
+            --gitleaks-ignore-path "${IGNORE}" \
+            --max-decode-depth 3 --max-archive-depth 2 \
+            repo
+
+  semgrep:
+    name: Semgrep Local SAST
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      SEMGREP_IMAGE: semgrep/semgrep@sha256:6f6f4c1ea22ae02736b023dd4dcc842a4f50b25bbe1898530ec3bfff388b369b
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            auth.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+      - name: Checkout repository under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Checkout pinned scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      - name: Pull digest-pinned Semgrep non-root image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Anonymous Docker Hub pulls are rate limited per source IP and GitHub-hosted
+          # runners share egress addresses, so a transient 429 must not fail the gate.
+          for attempt in 1 2 3 4 5; do
+            if docker pull "${SEMGREP_IMAGE}"; then exit 0; fi
+            echo "Semgrep image pull attempt ${attempt} failed; retrying in $((attempt * 20))s" >&2
+            sleep "$((attempt * 20))"
+          done
+          echo "::error::Could not pull the pinned Semgrep image after 5 attempts."
+          exit 1
+      - name: Semgrep local + vendored community rules, offline container
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # The Semgrep image runs as a non-root uid that differs from the runner user,
+          # so the bind-mounted output directory must be world-writable.
+          mkdir -p reports && chmod 0777 reports
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+            -e HOME=/tmp \
+            -v "${PWD}/repo:/src:ro" \
+            -v "${PWD}/scanner/security:/rules:ro" \
+            -v "${PWD}/reports:/out:rw" \
+            -w /src \
+            "${SEMGREP_IMAGE}" \
+            semgrep scan \
+              --config /rules/semgrep-rules.yml \
+              --config /rules/semgrep \
+              --metrics off \
+              --sarif \
+              --output /out/semgrep.sarif
+      - name: Block on ERROR-severity results only
+        run: python3 scanner/security/gate_sarif.py reports/semgrep.sarif --fail-on error --label Semgrep
+      - name: Upload Semgrep results to code scanning
+        if: ${{ always() && inputs.upload-sarif && github.event.pull_request.head.repo.fork != true }}
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+      - name: Upload Semgrep report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-report
+          path: reports/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  dependency-review:
+    name: Dependency Review
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft != true && inputs.enable-dependency-review }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: false
+
+  osv:
+    name: OSV Dependency Vulnerability Scan
+    if: ${{ github.event.pull_request.draft != true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+            api.osv.dev:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Scan dependency manifests and lockfiles
+        id: osvscan
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=osv-results.json
+            --include-git-root
+            -r
+            ./
+      - name: Fail closed if OSV itself did not complete
+        if: ${{ steps.osvscan.outcome == 'failure' }}
+        run: |
+          if [ ! -s osv-results.json ]; then
+            echo "::error::OSV-Scanner failed without producing results. Blocking merge."
+            exit 1
+          fi
+      - name: Report and block on vulnerabilities
+        uses: google/osv-scanner-action/osv-reporter-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+        with:
+          scan-args: |-
+            --output=osv-results.sarif
+            --new=osv-results.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+      - name: Upload OSV report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osv-report
+          path: |
+            osv-results.json
+            osv-results.sarif
+          retention-days: 14
+          if-no-files-found: ignore
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    if: ${{ github.event.pull_request.draft != true && inputs.enable-codeql }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+      - name: Analyze
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+
+  merge-gate:
+    name: Merge Gate
+    if: ${{ always() }}
+    needs: [static-policy, quality, gitleaks, semgrep, dependency-review, osv, codeql]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      STATIC_POLICY: ${{ needs.static-policy.result }}
+      QUALITY: ${{ needs.quality.result }}
+      GITLEAKS: ${{ needs.gitleaks.result }}
+      SEMGREP: ${{ needs.semgrep.result }}
+      DEP_REVIEW: ${{ needs.dependency-review.result }}
+      OSV: ${{ needs.osv.result }}
+      CODEQL: ${{ needs.codeql.result }}
+    steps:
+      - name: Require every enabled security job to pass
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          status=0
+          {
+          echo "## Merge Gate"
+          echo ""
+          echo "| Job | Result |"
+          echo "| --- | --- |"
+          for item in \
+            "static-policy=${STATIC_POLICY}" \
+            "quality=${QUALITY}" \
+            "gitleaks=${GITLEAKS}" \
+            "semgrep=${SEMGREP}" \
+            "dependency-review=${DEP_REVIEW}" \
+            "osv=${OSV}" \
+            "codeql=${CODEQL}"; do
+            name="${item%%=*}"
+            result="${item#*=}"
+            printf '| %s | %s |\n' "${name}" "${result}"
+            case "${result}" in
+              success|skipped) ;;
+              *) status=1 ;;
+            esac
+          done
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::One or more security jobs did not pass. Do not bypass this gate; see docs/INCIDENT_RESPONSE.md."
+          fi
+          exit "${status}"

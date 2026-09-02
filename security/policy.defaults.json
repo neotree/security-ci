@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "block_severities": [
+    "critical",
+    "high"
+  ],
+  "max_text_file_bytes": 52428800,
+  "max_config_file_bytes": 16384,
+  "max_config_line_length": 400,
+  "anomalous_line_length": 2500,
+  "max_entrypoint_line_length": 1500,
+  "scan_build_artifacts": true,
+  "artifact_globs": [
+    "build/**",
+    "dist/**",
+    "out/**"
+  ],
+  "hidden_whitespace_run": 120,
+  "max_tab_run": 12,
+  "max_line_length": 20000,
+  "high_entropy_min_length": 180,
+  "high_entropy_threshold": 5.35,
+  "allowed_npm_registries": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com"
+  ],
+  "allow_git_dependencies": false,
+  "require_npm_lock_integrity": true,
+  "verify_npm_registry_signatures": true,
+  "audit_severity": "high",
+  "block_console_methods": [
+    "log",
+    "debug",
+    "info"
+  ],
+  "console_severity": "medium",
+  "console_exempt_globs": [
+    "tests/**",
+    "test/**",
+    "scripts/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*.stories.*"
+  ],
+  "require_lint_script": true,
+  "require_typecheck_for_typescript": true,
+  "run_tests_if_present": true,
+  "run_build_if_present": true,
+  "sensitive_review_label": "security-reviewed:<head-sha7>",
+  "exceptions": []
+}

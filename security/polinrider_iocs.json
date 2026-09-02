@@ -1,0 +1,80 @@
+{
+  "version": "2026-09-02e",
+  "markers": [
+    "0xa322E5f3D311D3080e6f0121063e9aDC2490Ef1a",
+    "0xa322e5f3d311d3080e6f0121063e9adc2490ef1a",
+    "2[gWfGj;<:-93Z^C",
+    "Cot%3t=shtP",
+    "TA48dct6rFW8BXsiLAtjFaVFoSuryMjD3v",
+    "TCqf6ZkaQD84vYsC2cuu1jRwB6JveTaRrF",
+    "TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP",
+    "TXfxHUet9pJVU1BgVkBAbrES4YUc1nGzcG",
+    "_$_1e42",
+    "config.bat",
+    "e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9",
+    "function MDy(f)",
+    "global.e='NPM'",
+    "global.i=\"2-35-16\"",
+    "global.i=\"2-35-17\"",
+    "global.i=\"2-35-5\"",
+    "global.i=\"A10-*19290\"",
+    "global.i='2-35-16'",
+    "global.i='2-35-17'",
+    "global.i='2-35-5'",
+    "global.i='5-4-27'",
+    "global['!']='4-1928'",
+    "global['!']='8-1638-2'",
+    "global['!']='9-0191-4'",
+    "global['_V']='5-4-27'",
+    "global['_V']='A4-1928'",
+    "m6:tTh^D)cBz?NM]",
+    "q4FZkxX{!h,Sr3=@",
+    "rmcej%otb%",
+    "temp_auto_push.bat",
+    "temp_interactive_push.bat",
+    "y-p_>d$0B&@^1aQk"
+  ],
+  "domains": [
+    "136.0.9.8",
+    "154.91.0.103",
+    "166.88.134.82",
+    "166.88.4.2",
+    "166.88.54.158",
+    "188.43.33.249",
+    "198.105.127.210",
+    "1rpc.io",
+    "202.155.8.173",
+    "23.27.120.142",
+    "23.27.202.27",
+    "api.trongrid.io",
+    "bsc-dataseed.binance.org",
+    "bsc-rpc.publicnode.com",
+    "default-configuration.vercel.app",
+    "eth.blockscout.com",
+    "eth.drpc.org",
+    "ethereum-rpc.publicnode.com",
+    "fullnode.mainnet.aptoslabs.com"
+  ],
+  "known_malicious_packages": [
+    "tailwindcss-style-animate",
+    "tailwind-mainanimation",
+    "tailwind-autoanimation",
+    "tailwindcss-typography-style",
+    "tailwindcss-style-modify",
+    "tailwindcss-animate-style"
+  ],
+  "context_markers": [
+    "LAST_COMMIT_DATE"
+  ],
+  "sources": [
+    "https://github.com/orgs/community/discussions/188732",
+    "https://github.com/orgs/community/discussions/197873",
+    "Neotree internal incident report, classification CRITICAL (2026-09-02)"
+  ],
+  "notes": {
+    "tron_address_correction": "The Neotree incident report lists TMfKQEd7TJJa5xNZJZLep838vrzrs7mAP (33 chars). TRON addresses are 34 characters; the correct value is TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP, which is what this file carries. Correct it at the source document - a malformed indicator never matches anything.",
+    "identifier_strategy": "Campaign identifiers rotate per build (2-35-5, 2-35-16, 2-35-17, 5-4-27, A10-*19290, 4-1928, 8-1638-2, 9-0191-4, A4-1928, NPM). Detection does not depend on this list: POLINRIDER_GLOBAL_TAG in scan_repo.py matches the assignment SHAPE. All ten known values were verified against it.",
+    "author_identity_is_not_an_indicator": "Commit author identity is deliberately NOT used as an indicator. This malware runs on any compromised developer machine and pushes using whatever cached Git credentials it finds, so the account on a malicious commit belongs to a victim, not an attacker. Denylisting it would name that victim while catching only the one account already burned. Author metadata is checked for spoofing (invisible/bidi characters) instead, which is behavioural and applies to everyone equally."
+  },
+  "infrastructure_severity": "high"
+}

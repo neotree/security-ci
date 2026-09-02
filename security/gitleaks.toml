@@ -1,0 +1,23 @@
+# Always invoke Gitleaks with this trusted config so a PR-controlled .gitleaks.toml
+# cannot suppress detections. Extend the built-in rule set rather than replacing it.
+[extend]
+useDefault = true
+
+# This repository commits Next.js build output to its deployment branches. Minified
+# bundles set off the low-confidence heuristics constantly: a full-history scan produced
+# 2,284 findings, of which 2,274 were inside build/ and 2,088 came from `generic-api-key`
+# matching content hashes and base64 chunks.
+#
+# The allowlist is scoped by rule AND path, not global: high-confidence rules (AWS, GitHub,
+# Stripe, Slack, GCP, npm tokens, ...) still apply to build output, so a real credential
+# inlined into a client bundle - a leak that appears ONLY in the artifact, never in source -
+# is still caught. Source is never allowlisted.
+[[allowlists]]
+description = "Heuristic rules produce noise on minified build artifacts"
+targetRules = ["generic-api-key", "private-key", "sourcegraph-access-token"]
+paths = [
+  '''(^|/)build/''',
+  '''(^|/)dist/''',
+  '''(^|/)out/''',
+  '''(^|/)\.next/''',
+]
