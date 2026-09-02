@@ -462,12 +462,21 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # Deliberately no pipeline here. Wrapping this in `{ ... } | tee` puts the loop
+          # in a subshell, so assignments to `status` are discarded and the gate exits 0
+          # no matter which jobs failed. shellcheck SC2030/SC2031 catch exactly that.
+          emit() {
+            printf '%s\n' "$1"
+            printf '%s\n' "$1" >> "${SUMMARY}"
+          }
+
           status=0
-          {
-          echo "## Merge Gate"
-          echo ""
-          echo "| Job | Result |"
-          echo "| --- | --- |"
+          emit "## Merge Gate"
+          emit ""
+          emit "| Job | Result |"
+          emit "| --- | --- |"
           for item in \
             "static-policy=${STATIC_POLICY}" \
             "quality=${QUALITY}" \
@@ -478,14 +487,16 @@ jobs:
             "codeql=${CODEQL}"; do
             name="${item%%=*}"
             result="${item#*=}"
-            printf '| %s | %s |\n' "${name}" "${result}"
+            emit "| ${name} | ${result} |"
             case "${result}" in
               success|skipped) ;;
               *) status=1 ;;
             esac
           done
-          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
           if [ "${status}" -ne 0 ]; then
+            emit ""
+            emit "One or more security jobs did not pass. Do not bypass this gate; see docs/INCIDENT_RESPONSE.md."
             echo "::error::One or more security jobs did not pass. Do not bypass this gate; see docs/INCIDENT_RESPONSE.md."
           fi
           exit "${status}"

@@ -67,8 +67,14 @@ nothing blocks until the checks are marked required.
 ```bash
 python3 -m unittest discover -s security/tests -t . -v   # 130 regression tests
 python3 security/scan_repo.py --root .                   # scan this repo with itself
-./security/install_actionlint.sh                          # then lint the workflows
+shellcheck --severity=warning security/*.sh
+$(./security/install_actionlint.sh) .github/workflows/*.yml templates/workflows/*.yml
 ```
+
+**Install shellcheck before linting workflows.** actionlint runs it over every `run:`
+block, but only when it is on `PATH` — otherwise it skips that analysis and reports
+success. A clean actionlint run without shellcheck installed means considerably less than
+it appears to.
 
 The `Self Test` workflow runs all of that plus `shellcheck` and an Action-pinning check on
 every pull request. A change that breaks detection fails here rather than silently

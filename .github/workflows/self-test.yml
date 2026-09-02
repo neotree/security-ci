@@ -37,8 +37,18 @@ jobs:
       - name: Lint workflows (pinned binary + checksum)
         run: |
           set -Eeuo pipefail
+          # actionlint runs shellcheck over every `run:` block, but ONLY if shellcheck is
+          # on PATH - otherwise it silently skips that analysis and reports success. That
+          # silence once let a subshell bug reach CI in which the Merge Gate exited 0 no
+          # matter which jobs failed. Assert the tool is present rather than trusting it.
+          command -v shellcheck >/dev/null 2>&1 || {
+            echo "::error::shellcheck is not installed; actionlint would silently skip"
+            echo "::error::analysis of every run: block. Refusing to report a false pass."
+            exit 1
+          }
+          shellcheck --version | head -2
           ACTIONLINT="$(./security/install_actionlint.sh)"
-          "${ACTIONLINT}" -color .github/workflows/*.yml
+          "${ACTIONLINT}" -color .github/workflows/*.yml templates/workflows/*.yml
       - name: Lint shell scripts
         run: shellcheck --severity=warning security/*.sh
       - name: Scan this repository with its own scanner
