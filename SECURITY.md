@@ -1,25 +1,35 @@
 # Security Policy
 
-## Reporting a vulnerability
+## Reporting
 
 **Do not open a public issue.** This repository is the security pipeline for several
 Neotree services, so a weakness here affects all of them.
 
-Report privately through
-[private vulnerability reporting](https://github.com/neotree/security-ci/security/advisories/new),
-or email **security@neotree.org**.
+The reporting process is the organisation-wide one in
+[neotree/.github](https://github.com/neotree/.github/blob/main/SECURITY.md), reachable from
+this repository's [Security tab](https://github.com/neotree/security-ci/security/policy).
+Use private vulnerability reporting, or the address given there.
 
-Especially valuable: a way to get a payload past the gate, a way for a repository's policy
-overlay to weaken the shared defaults, or a way to influence the scanner from a pull
-request in a consuming repository.
+This file adds only what is specific to this repository.
 
-## Scope
+## Especially valuable reports
 
-In scope: everything in `security/` and `.github/workflows/`.
+- A way to get a payload past the gate — a variant of the campaign this was built for, or
+  any other malicious change, that the scanners do not flag.
+- A way for a consuming repository's policy overlay to **weaken** the shared defaults.
+  Overlays are supposed to tighten only; `merge_policy` rejects attempts to remove a
+  blocking severity or raise the audit floor.
+- A way for a pull request in a consuming repository to **influence the scanner**. The
+  trusted gate runs the scanner from this repository at a pinned SHA and reads the policy
+  overlay from the caller's base commit precisely to prevent that.
+- A way to make a scanner report success when it did not run, or when it skipped analysis.
+  Two real instances of this class have already been fixed: a merge gate that exited 0
+  regardless of job results, and actionlint silently skipping shellcheck when it was absent.
 
-Out of scope: findings that require an already-compromised maintainer account, and
-false-positive reports (open a normal issue for those — they are welcome, just not
-vulnerabilities).
+## Out of scope
+
+Findings that require an already-compromised maintainer account, and false positives —
+those are welcome as normal issues, they just are not vulnerabilities.
 
 ## What this repository deliberately does not contain
 
