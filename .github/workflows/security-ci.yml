@@ -87,6 +87,10 @@ jobs:
           ref: ${{ inputs.security-ci-ref }}
           path: scanner
           persist-credentials: false
+      - name: Verify the caller pins workflow and scanner to the same commit
+        # Dependabot updates `uses:` but not `security-ci-ref`, so a routine bump would
+        # otherwise run a new workflow against an old scanner with nothing saying so.
+        run: python3 scanner/security/check_caller_pin.py repo
       - name: Scanner regression tests
         working-directory: scanner
         run: python3 -m unittest discover -s security/tests -t . -v
@@ -230,23 +234,18 @@ jobs:
           ref: ${{ inputs.security-ci-ref }}
           path: scanner
           persist-credentials: false
-      - name: Gitleaks full Git history scan (pinned binary + checksum)
+      - name: Gitleaks secret scan (pinned binary + checksum)
         shell: bash
         env:
-          IGNORE_PATH: ${{ inputs.gitleaks-ignore }}
-        run: |
-          set -Eeuo pipefail
           # Trusted config from security-ci; acknowledged fingerprints from the repo itself,
           # because a leak and its remediation are inherently repository-specific.
-          IGNORE="scanner/security/empty-gitleaks-ignore.txt"
-          if [ -f "repo/${IGNORE_PATH}" ]; then IGNORE="repo/${IGNORE_PATH}"; fi
-          BIN="$(./scanner/security/install_gitleaks.sh)"
-          "${BIN}" git \
-            --config scanner/security/gitleaks.toml \
-            --redact --no-banner --ignore-gitleaks-allow \
-            --gitleaks-ignore-path "${IGNORE}" \
-            --max-decode-depth 3 --max-archive-depth 2 \
-            repo
+          GITLEAKS_IGNORE_PATH: repo/${{ inputs.gitleaks-ignore }}
+          # Scope the scan to what this change introduces. Full history runs on the
+          # schedule; re-walking it on every pull request costs ~9 minutes here and finds
+          # nothing new, because history does not change between pull requests. The script
+          # falls back to a full scan whenever the range cannot be established.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: ./scanner/security/run_secret_scan.sh repo "${BASE_SHA}"
 
   semgrep:
     name: Semgrep Local SAST

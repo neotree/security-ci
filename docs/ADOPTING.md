@@ -12,8 +12,15 @@ git ls-remote https://github.com/neotree/security-ci refs/heads/main
 ```
 
 That 40-character SHA goes in **two places per workflow**: the `uses:` line and the
-`security-ci-ref` input. They must match. The gate refuses to run if the ref is not a full
-SHA, because a branch or tag can be moved and the whole trust model rests on that pin.
+`security-ci-ref` input. They must match, and the pipeline enforces it — `uses:` decides
+which workflow runs, `security-ci-ref` decides which scanner is checked out, and Dependabot
+updates only the first. A bump that touches one and not the other would otherwise run a new
+workflow against an old scanner with nothing anywhere saying so. `check_caller_pin.py`
+fails the build on that mismatch, and the trusted gate checks the **base** commit's copy so
+a pull request cannot relax its own pin.
+
+The gate also refuses to run if the ref is not a full SHA, because a branch or tag can be
+moved and the whole trust model rests on that pin.
 
 ## 2. Copy the files
 

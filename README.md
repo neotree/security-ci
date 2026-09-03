@@ -56,6 +56,16 @@ request in each consuming repository, gated by that repository's own pipeline.
 The trade-off is honest: updates are not instant. For a security control that is the right
 side to err on.
 
+Dependabot updates the `uses:` line but not the `security-ci-ref` input, which would leave a
+new workflow running an old scanner. `security/check_caller_pin.py` fails the build when
+those two disagree, so the drift is loud rather than silent.
+
+**Secret-scan cost.** Pull requests scan only the commits the change introduces; full
+history runs on the schedule. On `neotree-editor` that is ~0.4s versus 9 minutes, and it
+finds the same things — history does not change between pull requests. The script falls
+back to a full scan whenever the range cannot be established (shallow clone, force-push,
+first push), so a narrowed scope is never silently mistaken for a clean one.
+
 ## A note on severity gates
 
 Two scanners, two conventions, both of which silently defeat a naive gate:
