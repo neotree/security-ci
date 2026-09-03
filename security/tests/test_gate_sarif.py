@@ -175,3 +175,29 @@ class CvssGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSuiteIntegrityTests(unittest.TestCase):
+    """A duplicated class name silently shadows the earlier definition, so its tests stop
+    running while the suite still reports success. That happened here: three classes were
+    defined twice after the split into a shared repository, and the assertions that mattered
+    for the shared defaults never executed."""
+
+    def test_no_test_class_is_defined_twice(self):
+        import collections, re
+        for path in sorted(SECURITY.glob("tests/test_*.py")):
+            names = re.findall(r"^class (\w+)\(", path.read_text(encoding="utf-8"), re.M)
+            dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+            self.assertEqual([], dupes, f"{path.name} defines {dupes} more than once")
+
+    def test_no_test_method_is_defined_twice_in_a_class(self):
+        import ast, collections
+        for path in sorted(SECURITY.glob("tests/test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                names = [n.name for n in node.body
+                         if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
+                dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+                self.assertEqual([], dupes, f"{path.name}:{node.name} defines {dupes} twice")
