@@ -1,14 +1,14 @@
 # Code Owners for the shared security pipeline.
 #
-# Everything in this repository is a security control for SIX repositories, so every path
-# is owned. Branch protection must have "Require review from Code Owners" enabled, and
-# both teams need at least Write access here - GitHub silently ignores an entry whose team
-# lacks access, and the control then fails open with no error anywhere.
+# Everything here is a security control for several repositories, so every path is owned.
+# Branch protection must have "Require review from Code Owners" enabled, and the team must
+# have at least Write access - GitHub rejects an entry whose team lacks access with
+# "Unknown owner", and the control then does nothing until it is fixed.
 #
-# Two teams on every path: a pull request author never satisfies their own Code Owner
-# review, so a single-team path stalls whenever that team is the author.
+# @neotree/core-devs has three members, so a pull-request author - who never satisfies
+# their own Code Owner review - always leaves two possible reviewers.
 
-*                       @neotree/maintainers @neotree/core-devs
-/security/              @neotree/maintainers @neotree/core-devs
-/.github/workflows/     @neotree/maintainers @neotree/core-devs
-/templates/             @neotree/maintainers @neotree/core-devs
+*                       @neotree/core-devs
+/security/              @neotree/core-devs
+/.github/workflows/     @neotree/core-devs
+/templates/             @neotree/core-devs
