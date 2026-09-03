@@ -30,6 +30,16 @@ on:
       enable-dependency-review:
         type: boolean
         default: true
+      osv-cvss-threshold:
+        description: >-
+          Block on OSV findings whose CVSS score is at or above this. OSV-Scanner marks
+          every SARIF result "warning" regardless of severity, so its own --fail-on-vuln
+          flag is all-or-nothing; the score lives in the rule's security-severity property
+          and is gated by security/gate_sarif.py instead. Default 9.0 (critical) is a
+          starting point to ratchet down, not a target. Newly INTRODUCED high-severity
+          dependencies are blocked separately and unconditionally by Dependency Review.
+        type: string
+        default: "9.0"
       enable-quality:
         description: Install dependencies and run audit/lint/typecheck/test/build.
         type: boolean
@@ -77,6 +87,10 @@ jobs:
           ref: ${{ inputs.security-ci-ref }}
           path: scanner
           persist-credentials: false
+      - name: Verify the caller pins workflow and scanner to the same commit
+        # Dependabot updates `uses:` but not `security-ci-ref`, so a routine bump would
+        # otherwise run a new workflow against an old scanner with nothing saying so.
+        run: python3 scanner/security/check_caller_pin.py repo
       - name: Scanner regression tests
         working-directory: scanner
         run: python3 -m unittest discover -s security/tests -t . -v
@@ -220,23 +234,18 @@ jobs:
           ref: ${{ inputs.security-ci-ref }}
           path: scanner
           persist-credentials: false
-      - name: Gitleaks full Git history scan (pinned binary + checksum)
+      - name: Gitleaks secret scan (pinned binary + checksum)
         shell: bash
         env:
-          IGNORE_PATH: ${{ inputs.gitleaks-ignore }}
-        run: |
-          set -Eeuo pipefail
           # Trusted config from security-ci; acknowledged fingerprints from the repo itself,
           # because a leak and its remediation are inherently repository-specific.
-          IGNORE="scanner/security/empty-gitleaks-ignore.txt"
-          if [ -f "repo/${IGNORE_PATH}" ]; then IGNORE="repo/${IGNORE_PATH}"; fi
-          BIN="$(./scanner/security/install_gitleaks.sh)"
-          "${BIN}" git \
-            --config scanner/security/gitleaks.toml \
-            --redact --no-banner --ignore-gitleaks-allow \
-            --gitleaks-ignore-path "${IGNORE}" \
-            --max-decode-depth 3 --max-archive-depth 2 \
-            repo
+          GITLEAKS_IGNORE_PATH: repo/${{ inputs.gitleaks-ignore }}
+          # Scope the scan to what this change introduces. Full history runs on the
+          # schedule; re-walking it on every pull request costs ~9 minutes here and finds
+          # nothing new, because history does not change between pull requests. The script
+          # falls back to a full scan whenever the range cannot be established.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: ./scanner/security/run_secret_scan.sh repo "${BASE_SHA}"
 
   semgrep:
     name: Semgrep Local SAST
@@ -370,6 +379,16 @@ jobs:
           persist-credentials: false
           submodules: false
           lfs: false
+      - name: Checkout pinned scanner
+        # security-ci contains no package manifests or lockfiles, so checking it out
+        # beside the repository under test adds no OSV scan targets. Verified: OSV reports
+        # "No package sources found" for this tree.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: .security-scanner
+          persist-credentials: false
       - name: Scan dependency manifests and lockfiles
         id: osvscan
         uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
@@ -388,14 +407,21 @@ jobs:
             echo "::error::OSV-Scanner failed without producing results. Blocking merge."
             exit 1
           fi
-      - name: Report and block on vulnerabilities
+      - name: Produce SARIF and annotations
+        # --fail-on-vuln=false on purpose: it fails on ANY vulnerability at any severity,
+        # which no repository with a real dependency tree can hold. The severity gate is
+        # the next step.
         uses: google/osv-scanner-action/osv-reporter-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
         with:
           scan-args: |-
             --output=osv-results.sarif
             --new=osv-results.json
             --gh-annotations=true
-            --fail-on-vuln=true
+            --fail-on-vuln=false
+      - name: Block on vulnerabilities at or above the CVSS threshold
+        run: |
+          python3 .security-scanner/security/gate_sarif.py osv-results.sarif \
+            --fail-on-cvss "${{ inputs.osv-cvss-threshold }}" --label OSV
       - name: Upload OSV report
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

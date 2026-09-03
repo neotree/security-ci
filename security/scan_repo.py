@@ -1325,6 +1325,20 @@ def merge_policy(defaults: dict, overlay: dict) -> tuple[dict, list[Finding]]:
         return dict(defaults), findings
 
     merged = {**defaults, **overlay}
+
+    # The dependency-audit floor may only move downward (stricter). "critical" is the
+    # loosest setting, so an overlay must not raise the floor above the central default.
+    audit_order = ["info", "low", "moderate", "high", "critical"]
+    d_audit = defaults.get("audit_severity", "high")
+    m_audit = merged.get("audit_severity", d_audit)
+    if d_audit in audit_order and m_audit in audit_order and audit_order.index(m_audit) > audit_order.index(d_audit):
+        merged["audit_severity"] = d_audit
+        findings.append(Finding(
+            "critical", "POLICY_OVERLAY_WEAKENED", "security/policy.json",
+            f"Repository policy raised audit_severity from {d_audit!r} to {m_audit!r}, which "
+            "audits less. Central defaults are enforced instead.",
+        ))
+
     default_block = set(defaults.get("block_severities", ["critical", "high"]))
     merged_block = set(merged.get("block_severities", []) or [])
     removed = default_block - merged_block

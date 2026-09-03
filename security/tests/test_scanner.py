@@ -713,6 +713,17 @@ class PolicyOverlayTests(unittest.TestCase):
         self.assertEqual([], findings)
         self.assertIn("medium", merged["block_severities"])
 
+    def test_overlay_cannot_loosen_the_audit_floor(self):
+        strict = {**POLICY, "audit_severity": "high"}
+        merged, findings = scan_repo.merge_policy(strict, {"audit_severity": "critical"})
+        self.assertIn("POLICY_OVERLAY_WEAKENED", {f.rule for f in findings})
+        self.assertEqual("high", merged["audit_severity"])
+
+    def test_overlay_may_tighten_the_audit_floor(self):
+        merged, findings = scan_repo.merge_policy(POLICY, {"audit_severity": "moderate"})
+        self.assertEqual([], findings)
+        self.assertEqual("moderate", merged["audit_severity"])
+
     def test_non_object_overlay_is_rejected(self):
         merged, findings = scan_repo.merge_policy(POLICY, ["not", "an", "object"])
         self.assertIn("POLICY_OVERLAY_INVALID", {f.rule for f in findings})

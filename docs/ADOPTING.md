@@ -12,8 +12,15 @@ git ls-remote https://github.com/neotree/security-ci refs/heads/main
 ```
 
 That 40-character SHA goes in **two places per workflow**: the `uses:` line and the
-`security-ci-ref` input. They must match. The gate refuses to run if the ref is not a full
-SHA, because a branch or tag can be moved and the whole trust model rests on that pin.
+`security-ci-ref` input. They must match, and the pipeline enforces it — `uses:` decides
+which workflow runs, `security-ci-ref` decides which scanner is checked out, and Dependabot
+updates only the first. A bump that touches one and not the other would otherwise run a new
+workflow against an old scanner with nothing anywhere saying so. `check_caller_pin.py`
+fails the build on that mismatch, and the trusted gate checks the **base** commit's copy so
+a pull request cannot relax its own pin.
+
+The gate also refuses to run if the ref is not a full SHA, because a branch or tag can be
+moved and the whole trust model rests on that pin.
 
 ## 2. Copy the files
 
@@ -70,6 +77,29 @@ has never been scanned — that is the point. Triage them:
 - **Historical secrets** → rotate first, then record the fingerprint in
   `security/gitleaks-ignore.txt` with a note saying what was rotated and when. Never add a
   fingerprint for a live credential.
+
+## 4b. Dependency thresholds are a starting point, not a target
+
+Two knobs decide how much of an existing dependency backlog blocks a merge. Both default
+to the loosest useful setting, because a gate nobody can satisfy is a gate everybody routes
+around.
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `audit_severity` (policy) | `critical` | `npm`/`yarn`/`pnpm` audit floor |
+| `osv-cvss-threshold` (workflow input) | `9.0` | OSV blocks at or above this CVSS score |
+
+Measured on `neotree-editor`: 243 advisories (15 low, 87 moderate, 130 high, 11 critical),
+and 186 OSV findings of which 4 are CVSS >= 9.0 and 102 are >= 7.0. A `high` floor is
+simply unreachable there today.
+
+What keeps this honest is that **Dependency Review blocks newly introduced high-severity
+dependencies on every pull request, unconditionally**. So the full-tree thresholds govern
+the *existing backlog*, while "don't make it worse" is enforced regardless.
+
+Ratchet down as the backlog clears: `9.0` -> `7.0` -> `4.0`, and `critical` -> `high` ->
+`moderate`. A repository may tighten either via its overlay; an attempt to loosen them is
+rejected and reported as `POLICY_OVERLAY_WEAKENED`.
 
 ## 5. Branch protection
 
