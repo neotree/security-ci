@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "block_severities": [
     "critical",
     "high"
@@ -27,7 +27,7 @@
   "allow_git_dependencies": false,
   "require_npm_lock_integrity": true,
   "verify_npm_registry_signatures": true,
-  "audit_severity": "high",
+  "audit_severity": "critical",
   "block_console_methods": [
     "log",
     "debug",
@@ -47,5 +47,6 @@
   "run_tests_if_present": true,
   "run_build_if_present": true,
   "sensitive_review_label": "security-reviewed:<head-sha7>",
-  "exceptions": []
+  "exceptions": [],
+  "_audit_severity_note": "Starting point, not a target. Measured on neotree-editor: 243 advisories (15 low, 87 moderate, 130 high, 11 critical), so a 'high' floor is unattainable today. Ratchet critical -> high -> moderate as the backlog burns down; a repository may tighten this via its overlay but never loosen it. Newly INTRODUCED high-severity dependencies are blocked separately and unconditionally by Dependency Review."
 }

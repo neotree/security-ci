@@ -149,19 +149,13 @@ jobs:
           ref: ${{ inputs.security-ci-ref }}
           path: scanner
           persist-credentials: false
-      - name: Gitleaks full Git history scan
+      - name: Gitleaks FULL Git history scan
         shell: bash
         env:
-          IGNORE_PATH: ${{ inputs.gitleaks-ignore }}
-        run: |
-          set -Eeuo pipefail
-          IGNORE="scanner/security/empty-gitleaks-ignore.txt"
-          if [ -f "repo/${IGNORE_PATH}" ]; then IGNORE="repo/${IGNORE_PATH}"; fi
-          BIN="$(./scanner/security/install_gitleaks.sh)"
-          "${BIN}" git --config scanner/security/gitleaks.toml \
-            --redact --no-banner --ignore-gitleaks-allow \
-            --gitleaks-ignore-path "${IGNORE}" \
-            --max-decode-depth 3 --max-archive-depth 2 repo
+          GITLEAKS_IGNORE_PATH: repo/${{ inputs.gitleaks-ignore }}
+        # No base SHA: this is the scan that walks everything, and the one that catches a
+        # secret predating the pipeline. Pull requests get the cheap incremental scope.
+        run: ./scanner/security/run_secret_scan.sh repo
 
   codeql:
     name: Scheduled CodeQL (${{ matrix.language }})

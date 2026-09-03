@@ -110,5 +110,68 @@ class GateSarifTests(unittest.TestCase):
         self.assertEqual(1, self.run_gate(doc))
 
 
+class CvssGateTests(unittest.TestCase):
+    """OSV-Scanner marks EVERY result "warning" regardless of severity, and puts the real
+    severity in the rule's `security-severity` property as a CVSS score. Gating on the
+    SARIF level alone therefore blocks on everything or on nothing."""
+
+    def doc(self, scored):
+        """scored: list of (ruleId, cvss-or-None) -> a SARIF doc shaped like OSV's."""
+        rules, results = [], []
+        for rid, score in scored:
+            rule = {"id": rid}
+            if score is not None:
+                rule["properties"] = {"security-severity": str(score)}
+            rules.append(rule)
+            results.append({
+                "ruleId": rid, "level": "warning",
+                "message": {"text": rid},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": "yarn.lock"}, "region": {"startLine": 1}}}],
+            })
+        return {"version": "2.1.0",
+                "runs": [{"tool": {"driver": {"name": "osv-scanner", "rules": rules}},
+                          "results": results}]}
+
+    def run_gate(self, doc, *extra):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.sarif"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return gate.main([str(p), *extra])
+
+    def test_cvss_is_read_from_the_rule_property(self):
+        entries = gate.collect(self.doc([("CVE-1", 9.3), ("CVE-2", 5.3)]))
+        self.assertEqual([9.3, 5.3], [e["cvss"] for e in entries])
+        self.assertEqual(["critical", "medium"], [e["band"] for e in entries])
+
+    def test_sarif_level_alone_would_miss_a_critical(self):
+        """Every OSV result is "warning", so the default level gate passes a CVSS 9.3."""
+        doc = self.doc([("CVE-1", 9.3)])
+        self.assertEqual(0, self.run_gate(doc))
+        self.assertEqual(1, self.run_gate(doc, "--fail-on-cvss", "9.0"))
+
+    def test_threshold_selects_the_right_findings(self):
+        doc = self.doc([("crit", 9.3), ("high", 7.4), ("med", 5.3), ("low", 2.1)])
+        self.assertEqual(1, self.run_gate(doc, "--fail-on-cvss", "9.0"))
+        self.assertEqual(1, self.run_gate(doc, "--fail-on-cvss", "7.0"))
+        self.assertEqual(0, self.run_gate(doc, "--fail-on-cvss", "9.9"))
+
+    def test_missing_cvss_blocks_rather_than_reading_as_safe(self):
+        """An advisory with no score is still an advisory; absence is not evidence."""
+        self.assertEqual(1, self.run_gate(self.doc([("no-score", None)]), "--fail-on-cvss", "9.0"))
+
+    def test_clean_report_passes(self):
+        self.assertEqual(0, self.run_gate(self.doc([]), "--fail-on-cvss", "9.0"))
+
+    def test_band_boundaries(self):
+        self.assertEqual("critical", gate.cvss_band(9.0))
+        self.assertEqual("high", gate.cvss_band(8.9))
+        self.assertEqual("high", gate.cvss_band(7.0))
+        self.assertEqual("medium", gate.cvss_band(6.9))
+        self.assertEqual("low", gate.cvss_band(0.1))
+        self.assertEqual("none", gate.cvss_band(0.0))
+        self.assertEqual("unknown", gate.cvss_band(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
