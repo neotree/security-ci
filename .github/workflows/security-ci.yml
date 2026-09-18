@@ -261,6 +261,11 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
+          # registry-1.docker.io only serves the manifest; it 307s the layer blobs to one
+          # of Docker Hub's two CDNs and picks between them per request. Both must be
+          # allowed - listing only one makes `docker pull` fail deterministically whenever
+          # the redirect lands on the other, which is easy to misread as rate limiting
+          # because the manifest fetch itself succeeds.
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -268,6 +273,7 @@ jobs:
             auth.docker.io:443
             registry-1.docker.io:443
             production.cloudflare.docker.com:443
+            production.cloudfront.docker.com:443
       - name: Checkout repository under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -286,14 +292,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Anonymous Docker Hub pulls are rate limited per source IP and GitHub-hosted
-          # runners share egress addresses, so a transient 429 must not fail the gate.
+          # Anonymous Docker Hub pulls are rate limited per source IP (100/hour) and
+          # GitHub-hosted runners share egress addresses, so a transient 429 must not fail
+          # the gate. Rate limiting is transient and clears within these retries; a pull
+          # that fails all five attempts identically is usually not rate limiting but a
+          # blocked endpoint, so the failure message points at both.
           for attempt in 1 2 3 4 5; do
             if docker pull "${SEMGREP_IMAGE}"; then exit 0; fi
             echo "Semgrep image pull attempt ${attempt} failed; retrying in $((attempt * 20))s" >&2
             sleep "$((attempt * 20))"
           done
-          echo "::error::Could not pull the pinned Semgrep image after 5 attempts."
+          echo "::error::Could not pull the pinned Semgrep image after 5 attempts. If every attempt failed the same way this is more likely a harden-runner egress block than Docker Hub rate limiting: check the run's network policy report for a denied host and add it to allowed-endpoints."
           exit 1
       - name: Semgrep local + vendored community rules, offline container
         shell: bash
