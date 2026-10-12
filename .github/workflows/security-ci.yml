@@ -49,7 +49,9 @@ on:
         type: boolean
         default: true
       extra-egress-endpoints:
-        description: Newline-separated extra hosts the project's install/build needs.
+        description: >-
+          Space-separated host:port entries the project's install/build needs. harden-runner
+          splits on spaces only; write one per line with a folded scalar (`>-`), never `|`.
         type: string
         default: ""
 
@@ -156,6 +158,26 @@ jobs:
             registry.npmjs.org:443
             registry.yarnpkg.com:443
             ${{ inputs.extra-egress-endpoints }}
+      # A malformed entry is not rejected by harden-runner: a newline-joined list becomes
+      # one host with port 0 and the rest are dropped, so the build later dies with an
+      # ECONNREFUSED that looks like an outage. Fail here instead, naming the cause.
+      - name: Validate extra-egress-endpoints
+        shell: bash
+        env:
+          EXTRA: ${{ inputs.extra-egress-endpoints }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "${EXTRA}" == *$'\n'* ]]; then
+            echo "::error::extra-egress-endpoints contains a newline. harden-runner splits on spaces only, so these hosts are NOT allowed. Use a folded scalar (>-) or one space-separated line."
+            exit 1
+          fi
+          read -r -a entries <<< "${EXTRA}"
+          for entry in "${entries[@]}"; do
+            if [[ ! "${entry}" =~ ^[A-Za-z0-9*]([A-Za-z0-9.-]*[A-Za-z0-9])?:[0-9]{1,5}$ ]]; then
+              echo "::error::extra-egress-endpoints entry '${entry}' is not host:port."
+              exit 1
+            fi
+          done
       - name: Checkout repository under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
