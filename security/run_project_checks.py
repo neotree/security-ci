@@ -83,6 +83,11 @@ def clean_env() -> dict[str, str]:
         "YARN_ENABLE_SCRIPTS": "false",
         "PNPM_ENABLE_PRE_POST_SCRIPTS": "false",
         "HUSKY": "0",
+        # Build tooling phones home by default. The egress block already stops the
+        # request, but each blocked call costs retries and adds noise that buries the
+        # host a build genuinely needs in the network policy report. Off at source.
+        "NEXT_TELEMETRY_DISABLED": "1",
+        "CHECKPOINT_DISABLE": "1",
     })
     return env
 

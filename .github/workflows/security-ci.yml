@@ -138,10 +138,15 @@ jobs:
       YARN_ENABLE_SCRIPTS: "false"
       PNPM_ENABLE_PRE_POST_SCRIPTS: "false"
       HUSKY: "0"
+      NEXT_TELEMETRY_DISABLED: "1"
+      CHECKPOINT_DISABLE: "1"
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
+          # Hosts a specific project's build needs (Prisma engines, Google Fonts for
+          # next/font, ...) come from the caller's `extra-egress-endpoints`, so each one
+          # is visible and reviewed in the repository that needs it.
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -357,13 +362,24 @@ jobs:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: block
+          # The action looks up an OpenSSF Scorecard for every dependency the PR adds or
+          # changes (api.securityscorecards.dev, with api.deps.dev to map a package to its
+          # source repository). It only does this when dependencies change, so blocking
+          # these hosts passes most PRs and fails dependency PRs with a bare "fetch failed".
           allowed-endpoints: >
             github.com:443
             api.github.com:443
+            api.securityscorecards.dev:443
+            api.deps.dev:443
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
           comment-summary-in-pr: false
+      - name: Explain a network failure
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          echo "::error::If Dependency Review failed with 'fetch failed' rather than listing vulnerable packages, a host it needs was blocked by harden-runner. Check the 'domain not allowed' lines in this job's post-run log and add the host to allowed-endpoints."
 
   osv:
     name: OSV Dependency Vulnerability Scan

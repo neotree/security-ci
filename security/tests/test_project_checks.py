@@ -88,6 +88,22 @@ class ProjectRunnerTests(unittest.TestCase):
             self.assertIn("multiple lockfiles", err.getvalue())
 
 
+class CleanEnvTests(unittest.TestCase):
+    def test_strips_secrets_and_disables_scripts_and_telemetry(self):
+        original = dict(mod.os.environ)
+        try:
+            mod.os.environ.update({"NPM_TOKEN": "x", "MY_API_KEY": "x", "NEXT_TELEMETRY_DISABLED": "0"})
+            env = mod.clean_env()
+        finally:
+            mod.os.environ.clear()
+            mod.os.environ.update(original)
+        self.assertNotIn("NPM_TOKEN", env)
+        self.assertNotIn("MY_API_KEY", env)
+        self.assertEqual("true", env["NPM_CONFIG_IGNORE_SCRIPTS"])
+        self.assertEqual("1", env["NEXT_TELEMETRY_DISABLED"])
+        self.assertEqual("1", env["CHECKPOINT_DISABLE"])
+
+
 class AuditSeverityTests(unittest.TestCase):
     def test_severity_floor_comes_from_policy(self):
         floor = mod.audit_severity()
