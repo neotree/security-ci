@@ -89,7 +89,7 @@ jobs:
           category: repo-policy-scanner
       - name: Upload scan report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scheduled-policy-report
           path: reports/
@@ -239,7 +239,7 @@ jobs:
             --fail-on-cvss "${THRESHOLD}" --cvss-ceiling 9.0 --label OSV
       - name: Upload OSV report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scheduled-osv-report
           path: |
