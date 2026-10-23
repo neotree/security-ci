@@ -110,7 +110,9 @@ SENSITIVE_PREFIXES = (
 )
 SENSITIVE_CONFIG_NAMES = {
     ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs", ".pnpmfile.js", "pnpm-workspace.yaml",
-    ".semgrepignore", ".gitleaksignore", ".osv-scanner.toml",
+    # OSV reads `osv-scanner.toml` from any scanned directory (the dotted name is ours);
+    # either one can add package ignores. CI also passes the trusted config explicitly.
+    ".semgrepignore", ".gitleaksignore", ".osv-scanner.toml", "osv-scanner.toml",
 }
 ACTION_MANIFEST_NAMES = {"action.yml", "action.yaml"}
 
@@ -227,6 +229,20 @@ def entropy(value: str) -> float:
     counts = Counter(value)
     n = len(value)
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+# SQL assembled in a template literal before it reaches the driver, e.g.
+#   const sql = `DELETE FROM t WHERE id = ${id}`; await pool.query(sql);
+# which the call-site patterns cannot see. Upper-case keywords only (case-sensitive) so
+# prose such as `Update ${name} failed` in a log message does not match.
+SQL_TEMPLATE_BUILD = (
+    r"`\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE|DROP|ALTER|TRUNCATE|WITH)"
+    r"\s[^`]*?\$\{"
+)
+# Whole-line comments only. Deliberately narrow so it cannot be used to hide live code:
+# `/* */ pool.query(...)` closes its comment and `#field = pool.query(...)` is a JS
+# private field, so neither line is treated as a comment.
+SQL_COMMENT_LINE = re.compile(r"^\s*(?://|#(?:\s|$)|\*(?!/)|/\*(?!.*\*/))")
 
 
 def line_of(text: str, idx: int) -> int:
@@ -717,6 +733,181 @@ POLINRIDER_GLOBAL_TAG = re.compile(
 OBFUSCATED_IDENTIFIER = re.compile(r"_\$_[0-9a-fA-F]{2,8}\b")
 
 
+def match_lines(text: str, *patterns: re.Pattern[str]) -> list[int]:
+    """The line of every distinct match of every pattern, one entry per call site.
+
+    Per site, not per line: `eval(a); eval(b);` is two findings, so a `"sites": 1`
+    exception cannot quietly accept both because they share a line.
+    """
+    starts = {m.start() for pat in patterns for m in pat.finditer(text)}
+    return [line_of(text, s) for s in sorted(starts)]
+
+
+# --- Secrets written to logs ------------------------------------------------
+#
+# A credential in a log line outlives its rotation: logs are shipped, retained, and read
+# by people and systems that were never meant to hold the secret. node-api logged every
+# inbound x-api-key, valid or not, for months without any scanner noticing.
+LOG_CALL = re.compile(
+    r"\b(?:console|logger|log|winston|pino|bunyan|Sentry)\s*\.\s*"
+    r"(?:log|info|warn|warning|error|debug|trace|fatal|verbose|silly|http|captureMessage)\s*\("
+    r"|(?<![.\w$])log(?:Info|Error|Warn|Warning|Debug|Trace|Failure|Fatal|Message)?\s*\("
+)
+# Identifier (or quoted property name) that names a secret. Matched against code only:
+# a string literal such as 'No API key provided' is prose, not a value.
+SENSITIVE_NAME = re.compile(
+    r"(?i)(?:api[_-]?key|x-api-key|secret|passw(?:or)?d|passwd|\bpwd\b|token|authorization"
+    r"|bearer|private[_-]?key|credential|cookie)"
+)
+# Boolean flags about a secret (`allowApiKeyAuth`, `hasToken`) are not the secret.
+SENSITIVE_NAME_BENIGN_PREFIX = re.compile(
+    r"^(?:is|has|should|allow|allowed|enable|enabled|disable|disabled|use|uses|require|requires|can|with|without|no)(?=[A-Z_])"
+)
+# Names that mention a secret without holding one: a count, a length, a type, a header
+# name. `tokenCount` is not a token.
+SENSITIVE_NAME_BENIGN_SUFFIX = re.compile(
+    r"(?i)(?:count|length|size|type|types|name|names|field|url|path|expiry|expires|expiresat"
+    r"|ttl|valid|invalid|present|missing|required|error|errors|status|header|headers|label)$"
+)
+# Wrapping the value in one of these is the remedy, so its presence clears the call.
+LOG_SANITIZER = re.compile(r"(?i)\b\w*(?:mask|redact|hash|sha\d*|digest|fingerprint|obfuscate|truncate)\w*\s*\(")
+
+
+def _log_call_code(text: str, open_paren: int, limit: int = 2000) -> tuple[str, list[str]]:
+    """Return (code, quoted_keys) for a call's argument list.
+
+    `code` is the argument text with string-literal CONTENT removed but template
+    interpolations (`${...}`) kept, so only expressions remain. `quoted_keys` are string
+    literals used as bracket property names (`headers['x-api-key']`), which name a value
+    even though they are strings.
+    """
+    out: list[str] = []
+    keys: list[str] = []
+    depth, i, end = 1, open_paren + 1, min(len(text), open_paren + 1 + limit)
+    while i < end and depth:
+        c = text[i]
+        if c in "'\"":
+            j = i + 1
+            while j < end and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            prev = text[:i].rstrip()[-1:] if text[:i].rstrip() else ""
+            if prev == "[":
+                # Kept as an identifier in place, so it is judged - and sanitised - exactly
+                # like `.apiKey` would be.
+                out.append(" KEY_" + re.sub(r"\W", "_", text[i + 1:j]) + " ")
+            else:
+                out.append("''")
+            i = j + 1
+            continue
+        if c == "`":
+            j = i + 1
+            while j < end and text[j] != "`":
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text.startswith("${", j):
+                    k, d = j + 2, 1
+                    while k < end and d:
+                        d += {"{": 1, "}": -1}.get(text[k], 0)
+                        k += 1
+                    expr = re.sub(r"'[^'\n]*'|\"[^\"\n]*\"", "''", text[j + 2:k - 1])
+                    out.append(" " + expr + " ")
+                    j = k
+                    continue
+                j += 1
+            i = j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                break
+        out.append(c)
+        i += 1
+    return "".join(out), keys
+
+
+# What follows a name when only its presence or size is logged. `?.` and `??` are not
+# here: `apiKey?.trim()` and `apiKey ?? 'none'` both log the value itself.
+PRESENCE_CHECK = re.compile(r"\s*\??\.\s*length\b|\s*(?:!==?|===?|\?(?![.?]))")
+
+
+def _strip_sanitized(code: str) -> str:
+    """Remove every sanitizer call, arguments included, from argument code."""
+    while True:
+        m = LOG_SANITIZER.search(code)
+        if not m:
+            return code
+        depth, i = 1, m.end()
+        while i < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[i], 0)
+            i += 1
+        code = code[:m.start()] + " _ " + code[i:]
+
+
+def _sensitive(name: str) -> bool:
+    return (bool(SENSITIVE_NAME.search(name))
+            and not SENSITIVE_NAME_BENIGN_SUFFIX.search(name)
+            and not SENSITIVE_NAME_BENIGN_PREFIX.search(name))
+
+
+def scan_secret_logging(rel: str, text: str, findings: list[Finding]) -> None:
+    lines = text.splitlines()
+    for m in LOG_CALL.finditer(text):
+        n = line_of(text, m.start())
+        if n <= len(lines) and SQL_COMMENT_LINE.match(lines[n - 1]):
+            continue
+        code, keys = _log_call_code(text, m.end() - 1)
+        # A sanitizer clears only its own arguments: `log(hash(id), apiKey)` still logs
+        # the raw key.
+        code = _strip_sanitized(code)
+        hits: list[str] = []
+        for ident in re.finditer(r"[A-Za-z_$][\w$]*", code):
+            # `token.length` / `apiKey ? ... : ...` style presence checks are not the value.
+            # `!!token` logs a boolean.
+            after = code[ident.end():ident.end() + 8]
+            before = re.sub(r"(?:[\w$]+\??\.)+$", "", code[:ident.start()]).rstrip()
+            if (_sensitive(ident.group()) and not before.endswith("!")
+                    and not re.match(PRESENCE_CHECK, after)):
+                name = ident.group()
+                hits.append(f"['{name[4:]}']" if name.startswith("KEY_") else name)
+        if hits:
+            findings.append(Finding(
+                "high", "SECRET_IN_LOG", rel,
+                f"Sensitive value ({hits[0]}) is passed to a log call. Logs are retained and "
+                "widely readable; log a redacted form or nothing.",
+                n,
+            ))
+
+
+# --- Inline scanner suppressions --------------------------------------------
+#
+# An inline allow-comment silences a scanner with no review, no reason and no expiry,
+# from inside an ordinary code change. Accepted risk belongs in security/policy.json or
+# security/gitleaks-ignore.txt, which are Code-Owner-reviewed and dated. The literals
+# are assembled so that this file does not suppress or flag itself.
+GITLEAKS_ALLOW = re.compile(r"\bgitleaks" + r":allow\b", re.IGNORECASE)
+NOSEMGREP = re.compile(r"\bno" + r"semgrep\b", re.IGNORECASE)
+
+
+def scan_inline_suppressions(rel: str, text: str, findings: list[Finding]) -> None:
+    for n in match_lines(text, GITLEAKS_ALLOW):
+        findings.append(Finding(
+            "high", "INLINE_SCANNER_SUPPRESSION", rel,
+            "Inline Gitleaks allow-comment hides a secret finding without review. Rotate the "
+            "secret and record its fingerprint in security/gitleaks-ignore.txt instead.",
+            n,
+        ))
+    for n in match_lines(text, NOSEMGREP):
+        findings.append(Finding(
+            "medium", "INLINE_SCANNER_SUPPRESSION", rel,
+            "Inline Semgrep suppression has no effect: this pipeline runs Semgrep with "
+            "--disable-nosem. Fix the finding or record a reviewed exception.",
+            n,
+        ))
+
+
 def scan_code_behavior(path: Path, rel: str, text: str, policy: dict, findings: list[Finding], ioc_hits: set[str]) -> None:
     ext = path.suffix.lower()
     is_code = ext in CODE_EXTS or is_config_file(path) or is_entrypoint_file(path)
@@ -769,11 +960,21 @@ def scan_code_behavior(path: Path, rel: str, text: str, policy: dict, findings: 
         r"\$executeRawUnsafe\s*\(",
         r"sequelize\s*\.\s*query\s*\(\s*`[^`]*\$\{",
     ]
-    for pat in sql_patterns:
-        m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
-        if m:
-            findings.append(Finding("high", "POSSIBLE_SQL_INJECTION", rel, "Dynamic/raw SQL construction detected; parameterize the query.", line_of(text, m.start())))
-            break
+    # Every site is reported, not just the first per file: each one is a separate
+    # vulnerability, and stopping at the first once surfaced a commented-out query while
+    # hiding a live, unauthenticated injection further down the same file. Matches on
+    # comment lines are skipped for the same reason - they point reviewers at dead code.
+    sql_spans: list[tuple[int, int]] = []
+    lines = text.splitlines()
+    for pat, flags in [(p, re.IGNORECASE | re.DOTALL) for p in sql_patterns] + [(SQL_TEMPLATE_BUILD, re.DOTALL)]:
+        for m in re.finditer(pat, text, flags):
+            n = line_of(text, m.start())
+            # A template inside a query(...) call is one site, not two.
+            inside = any(s <= m.start() < e for s, e in sql_spans)
+            sql_spans.append(m.span())
+            if inside or (n <= len(lines) and SQL_COMMENT_LINE.match(lines[n - 1])):
+                continue
+            findings.append(Finding("high", "POSSIBLE_SQL_INJECTION", rel, "Dynamic/raw SQL construction detected; parameterize the query.", n))
 
     # Generic obfuscation and code-execution behaviour.
     has_eval = bool(EVAL_CALL.search(text))
@@ -810,27 +1011,34 @@ def scan_code_behavior(path: Path, rel: str, text: str, policy: dict, findings: 
                 line_of(text, m.start()),
             ))
 
+    # Each site below is reported separately, not just the first in the file: a second
+    # eval or exec site behind a reviewed first one is a separate thing to review, and
+    # a first-match-only rule lets a payload hide behind a known, accepted call.
     if has_shell_pipe:
-        m = SHELL_PIPE_EXEC.search(text)
-        findings.append(Finding("critical", "DOWNLOAD_EXECUTE", rel, "Download-and-execute shell behavior detected.", line_of(text, m.start()) if m else None))
-    if has_eval and has_decoder:
-        m = EVAL_CALL.search(text)
-        findings.append(Finding("critical", "DECODE_AND_EXECUTE", rel, "Encoded/decoded content is dynamically executed.", line_of(text, m.start()) if m else None))
-    elif has_eval:
-        m = EVAL_CALL.search(text)
-        findings.append(Finding("high", "DYNAMIC_CODE_EXECUTION", rel, "Dynamic code execution (eval/new Function) is blocked.", line_of(text, m.start()) if m else None))
+        for n in match_lines(text, SHELL_PIPE_EXEC):
+            findings.append(Finding("critical", "DOWNLOAD_EXECUTE", rel, "Download-and-execute shell behavior detected.", n))
+    if has_eval:
+        for n in match_lines(text, EVAL_CALL):
+            if has_decoder:
+                findings.append(Finding("critical", "DECODE_AND_EXECUTE", rel, "Encoded/decoded content is dynamically executed.", n))
+            else:
+                findings.append(Finding("high", "DYNAMIC_CODE_EXECUTION", rel, "Dynamic code execution (eval/new Function) is blocked.", n))
     if has_exec and has_network:
-        m = CHILD_PROCESS_BINDING.search(text) or PROCESS_LAUNCH_CALL.search(text)
         corroborated = has_decoder or bool(ioc_hits) or has_shell_download
-        findings.append(Finding(
-            "critical" if corroborated else "high",
-            "NETWORK_PROCESS_CHAIN", rel,
-            "Process execution combined with network/download behavior is highly suspicious.",
-            line_of(text, m.start()) if m else None,
-        ))
+        for n in match_lines(text, CHILD_PROCESS_BINDING, PROCESS_LAUNCH_CALL):
+            findings.append(Finding(
+                "critical" if corroborated else "high",
+                "NETWORK_PROCESS_CHAIN", rel,
+                "Process execution combined with network/download behavior is highly suspicious.",
+                n,
+            ))
     elif has_exec and (is_config_file(path) or is_entrypoint_file(path)):
-        m = CHILD_PROCESS_BINDING.search(text) or PROCESS_LAUNCH_CALL.search(text)
-        findings.append(Finding("high", "CONFIG_PROCESS_EXEC", rel, "Process execution from an application entry point/config file requires removal or explicit redesign.", line_of(text, m.start()) if m else None))
+        for n in match_lines(text, CHILD_PROCESS_BINDING, PROCESS_LAUNCH_CALL):
+            findings.append(Finding("high", "CONFIG_PROCESS_EXEC", rel, "Process execution from an application entry point/config file requires removal or explicit redesign.", n))
+
+    if is_code:
+        scan_secret_logging(rel, text, findings)
+        scan_inline_suppressions(rel, text, findings)
 
     if is_config_file(path):
         limit = int(policy.get("max_config_file_bytes", 16384))
@@ -1271,6 +1479,9 @@ def validate_exceptions(policy: dict, findings: list[Finding], today: date) -> l
                 parsed_expiry = date.fromisoformat(expires)
             except ValueError:
                 problems.append("`expires` must be an ISO date (YYYY-MM-DD)")
+        sites = item.get("sites", 1)
+        if not isinstance(sites, int) or isinstance(sites, bool) or not 1 <= sites <= 50:
+            problems.append("`sites` must be an integer from 1 to 50 (findings covered per file)")
         if isinstance(rule, str) and rule in NON_EXEMPT_RULES:
             problems.append(f"rule {rule} can never be excepted")
         if problems:
@@ -1283,21 +1494,42 @@ def validate_exceptions(policy: dict, findings: list[Finding], today: date) -> l
                 f"Policy exception for {rule} expired on {parsed_expiry.isoformat()}; re-review it or remove the underlying risk.",
             ))
             continue
-        usable.append({"rule": rule, "paths": paths, "reason": reason.strip(), "expires": parsed_expiry.isoformat()})
+        usable.append({"rule": rule, "paths": paths, "reason": reason.strip(),
+                       "expires": parsed_expiry.isoformat(), "sites": sites})
     return usable
 
 
 def apply_exceptions(findings: list[Finding], exceptions: list[dict]) -> list[Finding]:
+    """Downgrade findings covered by an exception.
+
+    An exception covers at most `sites` findings (default 1) of its rule in each file.
+    Matching on rule and path alone let one reviewed `eval` silently cover every later
+    `eval` added to the same file; now a new site exceeds the count and the whole file's
+    findings for that rule block again until the exception is re-reviewed.
+    """
     if not exceptions:
         return findings
-    out: list[Finding] = []
-    for f in findings:
+    matched: dict[int, dict] = {}
+    per_file: dict[tuple[int, str], int] = {}
+    for i, f in enumerate(findings):
         if f.rule in NON_EXEMPT_RULES:
-            out.append(f)
             continue
-        match = next((e for e in exceptions if e["rule"] == f.rule and path_matches_any(f.path, e["paths"])), None)
+        idx = next((n for n, e in enumerate(exceptions)
+                    if e["rule"] == f.rule and path_matches_any(f.path, e["paths"])), None)
+        if idx is not None:
+            matched[i] = exceptions[idx]
+            per_file[(idx, f.path)] = per_file.get((idx, f.path), 0) + 1
+    out: list[Finding] = []
+    for i, f in enumerate(findings):
+        match = matched.get(i)
         if match is None:
             out.append(f)
+            continue
+        count = per_file[(exceptions.index(match), f.path)]
+        if count > match.get("sites", 1):
+            out.append(replace(f, message=(
+                f"{f.message} [exception covers {match.get('sites', 1)} site(s) in this file, "
+                f"found {count}: re-review before raising `sites`]")))
             continue
         # Downgraded, never deleted: the finding stays visible in logs and reports.
         out.append(replace(
@@ -1307,6 +1539,45 @@ def apply_exceptions(findings: list[Finding], exceptions: list[dict]) -> list[Fi
             message=f"{f.message} [accepted exception until {match['expires']}: {match['reason']}]",
         ))
     return out
+
+
+STRICT_WHEN_TRUE = (
+    "require_lint_script", "require_typecheck_for_typescript",
+    "require_test_script_when_tests_present", "run_tests_if_present", "run_build_if_present",
+    "scan_build_artifacts", "require_npm_lock_integrity", "verify_npm_registry_signatures",
+)
+STRICT_WHEN_FALSE = ("allow_git_dependencies",)
+# Detection limits: a larger value detects less.
+STRICT_WHEN_LOWER = (
+    "max_text_file_bytes", "max_config_file_bytes", "max_config_line_length",
+    "anomalous_line_length", "max_entrypoint_line_length", "hidden_whitespace_run",
+    "max_tab_run", "max_line_length", "high_entropy_min_length", "high_entropy_threshold",
+)
+
+
+# Keys a repository overlay may set at all. Everything else is central-only: an unlisted
+# key is ignored and reported, so a new loosening knob cannot appear by accident (as
+# `artifact_globs: ["**"]` did, re-classifying all source as build output). Keys starting
+# with "_" are comments.
+OVERLAY_ALLOWED_KEYS = frozenset({
+    "exceptions",
+    # Hygiene only (CONSOLE_CALL); never security-blocking on its own.
+    "console_exempt_globs", "block_console_methods", "console_severity",
+    # Private registries are a legitimate per-repository need; the file is Code-Owner
+    # protected and changing it is a SECURITY_CONTROL_CHANGE.
+    "allowed_npm_registries",
+    # Ratchets, each checked below to move only toward stricter.
+    "audit_severity", "block_severities", "artifact_globs",
+    *STRICT_WHEN_TRUE, *STRICT_WHEN_FALSE, *STRICT_WHEN_LOWER,
+})
+
+
+def _weakened(what: str) -> Finding:
+    return Finding(
+        "critical", "POLICY_OVERLAY_WEAKENED", "security/policy.json",
+        f"Repository policy {what}, which detects less. Central defaults are enforced "
+        "instead: a repository may tighten this gate, never loosen it.",
+    )
 
 
 def merge_policy(defaults: dict, overlay: dict) -> tuple[dict, list[Finding]]:
@@ -1324,7 +1595,24 @@ def merge_policy(defaults: dict, overlay: dict) -> tuple[dict, list[Finding]]:
                                 "Policy overlay is not a JSON object; central defaults enforced."))
         return dict(defaults), findings
 
+    overlay = dict(overlay)
+    for key in sorted(overlay):
+        if key.startswith("_") or key in OVERLAY_ALLOWED_KEYS:
+            continue
+        findings.append(_weakened(f"set {key!r}, which only the central policy may set"))
+        del overlay[key]
+
     merged = {**defaults, **overlay}
+
+    # Files matching artifact_globs get the reduced artifact profile (no behavioural rules),
+    # so adding a glob scans less. An overlay may only drop entries, never add them.
+    if "artifact_globs" in overlay:
+        d_globs = list(defaults.get("artifact_globs", []))
+        o_globs = overlay["artifact_globs"]
+        if not isinstance(o_globs, list) or any(g not in d_globs for g in o_globs):
+            merged["artifact_globs"] = d_globs
+            findings.append(_weakened(
+                f"set artifact_globs to {o_globs!r}; only a subset of {d_globs!r} is allowed"))
 
     # The dependency-audit floor may only move downward (stricter). "critical" is the
     # loosest setting, so an overlay must not raise the floor above the central default.
@@ -1338,6 +1626,23 @@ def merge_policy(defaults: dict, overlay: dict) -> tuple[dict, list[Finding]]:
             f"Repository policy raised audit_severity from {d_audit!r} to {m_audit!r}, which "
             "audits less. Central defaults are enforced instead.",
         ))
+
+    # Switches and limits that only ever move one way. Each was overridable before, so
+    # `"run_tests_if_present": false` or a raised size limit quietly switched a check off.
+    for key in STRICT_WHEN_TRUE:
+        if defaults.get(key) is True and merged.get(key) is not True:
+            merged[key] = True
+            findings.append(_weakened(f"set {key} to {overlay.get(key)!r}"))
+    for key in STRICT_WHEN_FALSE:
+        if defaults.get(key) is False and merged.get(key) is not False:
+            merged[key] = False
+            findings.append(_weakened(f"set {key} to {overlay.get(key)!r}"))
+    for key in STRICT_WHEN_LOWER:
+        d, m = defaults.get(key), merged.get(key)
+        if isinstance(d, (int, float)) and not isinstance(d, bool):
+            if not isinstance(m, (int, float)) or isinstance(m, bool) or m > d:
+                merged[key] = d
+                findings.append(_weakened(f"raised {key} from {d!r} to {m!r}"))
 
     default_block = set(defaults.get("block_severities", ["critical", "high"]))
     merged_block = set(merged.get("block_severities", []) or [])

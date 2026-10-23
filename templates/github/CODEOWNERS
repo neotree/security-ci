@@ -21,5 +21,12 @@
 /.yarnrc                    @neotree/core-devs
 /.yarnrc.yml                @neotree/core-devs
 /.pnpmfile.cjs              @neotree/core-devs
+/pnpm-workspace.yaml        @neotree/core-devs
+# Scanner scope and suppression files: each can silence a scanner for the whole repository.
+/.semgrepignore             @neotree/core-devs
+/.gitleaksignore            @neotree/core-devs
+/.osv-scanner.toml          @neotree/core-devs
+/osv-scanner.toml           @neotree/core-devs
+/.gitattributes             @neotree/core-devs
 /.github/CODEOWNERS         @neotree/core-devs
 /.github/dependabot.yml     @neotree/core-devs

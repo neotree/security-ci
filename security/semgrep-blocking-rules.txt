@@ -1,0 +1,55 @@
+# Semgrep rules that BLOCK the build even though their severity is WARNING.
+#
+# The Semgrep job blocks on ERROR. Most community rules ship as WARNING, which left SQL
+# injection, hardcoded JWT/session secrets, XXE, SSRF and TLS bypass as advisory-only
+# annotations nobody is obliged to read. These are the high-confidence ones: each names a
+# concrete vulnerability class rather than a hygiene or configuration preference.
+#
+# Deliberately NOT here (they stay advisory): cookie/header/CORS configuration audits,
+# React/DOM HTML sinks (sanitised usage is common and legitimate), directory listing,
+# sendFile, JWT revocation, cloud-infrastructure and Angular audit rules.
+#
+# Every id must exist in semgrep-rules.yml or semgrep/ - a test enforces it, so a typo
+# cannot silently match nothing. Matching is by dotted suffix, because Semgrep prefixes
+# each id with the path of the config file it was loaded from.
+
+# Injection
+javascript.lang.security.audit.sqli.node-knex-sqli.node-knex-sqli
+javascript.aws-lambda.security.pg-sqli.pg-sqli
+javascript.aws-lambda.security.mysql-sqli.mysql-sqli
+javascript.aws-lambda.security.sequelize-sqli.sequelize-sqli
+javascript.aws-lambda.security.knex-sqli.knex-sqli
+javascript.lang.security.detect-eval-with-expression.detect-eval-with-expression
+javascript.express.security.express-vm2-injection.express-vm2-injection
+javascript.express.security.express-insecure-template-usage.express-insecure-template-usage
+javascript.express.security.audit.res-render-injection.res-render-injection
+javascript.express.security.injection.raw-html-format.raw-html-format
+javascript.express.security.audit.xss.direct-response-write.direct-response-write
+javascript.chrome-remote-interface.security.audit.chrome-remote-interface-compilescript-injection.chrome-remote-interface-compilescript-injection
+javascript.angular.security.detect-angular-element-taint.detect-angular-element-taint
+
+# Request forgery, traversal, redirects, deserialisation
+javascript.express.security.audit.express-ssrf.express-ssrf
+javascript.express.security.audit.express-path-join-resolve-traversal.express-path-join-resolve-traversal
+javascript.express.security.audit.express-open-redirect.express-open-redirect
+javascript.browser.security.open-redirect.js-open-redirect
+javascript.express.security.audit.express-third-party-object-deserialization.express-third-party-object-deserialization
+
+# XML external entities
+javascript.express.security.audit.express-xml2json-xxe-event.express-xml2json-xxe-event
+javascript.node-expat.security.audit.expat-xxe.expat-xxe
+javascript.sax.security.audit.sax-xxe.sax-xxe
+javascript.xml2json.security.audit.xml2json-xxe.xml2json-xxe
+
+# Hardcoded secrets
+javascript.express.security.express-jwt-hardcoded-secret.express-jwt-hardcoded-secret
+javascript.express.security.audit.express-session-hardcoded-secret.express-session-hardcoded-secret
+javascript.jsonwebtoken.security.jwt-hardcode.hardcoded-jwt-secret
+javascript.jose.security.jwt-hardcode.hardcoded-jwt-secret
+javascript.passport-jwt.security.passport-hardcode.hardcoded-passport-secret
+
+# Transport and cryptography
+problem-based-packs.insecure-transport.js-node.bypass-tls-verification.bypass-tls-verification
+javascript.lang.security.detect-pseudorandombytes.detect-pseudoRandomBytes
+javascript.lang.security.detect-disable-mustache-escape.detect-disable-mustache-escape
+javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration

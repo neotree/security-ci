@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -201,3 +202,131 @@ class TestSuiteIntegrityTests(unittest.TestCase):
                          if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
                 dupes = [n for n, c in collections.Counter(names).items() if c > 1]
                 self.assertEqual([], dupes, f"{path.name}:{node.name} defines {dupes} twice")
+
+
+class BlockRulesTests(unittest.TestCase):
+    """Reviewed WARNING rules promoted into the gate via --block-rules."""
+
+    BLOCK_FILE = SECURITY / "semgrep-blocking-rules.txt"
+    VENDORED_ID = "javascript.aws-lambda.security.pg-sqli.pg-sqli"
+
+    def run_gate(self, doc, *extra):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.sarif"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return gate.main([str(p), *extra])
+
+    def test_promoted_warning_rule_blocks_with_semgrep_path_prefix(self):
+        rid = "rules.semgrep." + self.VENDORED_ID
+        doc = sarif([result(rid)], [rule(rid, "warning")])
+        self.assertEqual(0, self.run_gate(doc, "--fail-on", "error"))
+        self.assertEqual(1, self.run_gate(doc, "--fail-on", "error", "--block-rules", str(self.BLOCK_FILE)))
+
+    def test_unlisted_warning_rule_stays_advisory(self):
+        rid = "rules.react-dangerously-set-inner-html"
+        doc = sarif([result(rid)], [rule(rid, "warning")])
+        self.assertEqual(0, self.run_gate(doc, "--fail-on", "error", "--block-rules", str(self.BLOCK_FILE)))
+
+    def test_suffix_match_requires_a_dot_boundary(self):
+        rid = "rules.semgrep.x" + self.VENDORED_ID
+        self.assertFalse(gate.rule_matches(rid, [self.VENDORED_ID]))
+
+    def test_missing_block_rules_file_fails_closed(self):
+        doc = sarif([], [])
+        self.assertEqual(1, self.run_gate(doc, "--block-rules", "/nonexistent/block.txt"))
+
+    def test_every_listed_rule_exists_in_the_shipped_rules(self):
+        # A typo would match nothing, silently leaving that rule advisory.
+        shipped = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in [SECURITY / "semgrep-rules.yml", *sorted((SECURITY / "semgrep").glob("*.yml"))]
+        )
+        missing = [e for e in gate.load_block_rules(self.BLOCK_FILE)
+                   if not re.search(rf"^\s*-?\s*id:\s*{re.escape(e)}\s*$", shipped, re.M)]
+        self.assertEqual([], missing)
+
+
+class CvssCeilingTests(unittest.TestCase):
+    def run_gate(self, *extra):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.sarif"
+            p.write_text(json.dumps(sarif([], [])), encoding="utf-8")
+            return gate.main([str(p), *extra])
+
+    def test_threshold_above_ceiling_is_refused(self):
+        self.assertEqual(1, self.run_gate("--fail-on-cvss", "10.0", "--cvss-ceiling", "9.0"))
+
+    def test_tighter_threshold_is_accepted(self):
+        self.assertEqual(0, self.run_gate("--fail-on-cvss", "7.0", "--cvss-ceiling", "9.0"))
+        self.assertEqual(0, self.run_gate("--fail-on-cvss", "9.0", "--cvss-ceiling", "9.0"))
+
+
+class FailClosedTests(unittest.TestCase):
+    """Reports that are not evidence of a completed scan must never pass."""
+
+    def run_gate(self, doc, *extra):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.sarif"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return gate.main([str(p), *extra])
+
+    def test_empty_document_fails(self):
+        self.assertEqual(1, self.run_gate({}))
+        self.assertEqual(1, self.run_gate({"runs": []}))
+        self.assertEqual(1, self.run_gate([]))
+
+    def test_run_without_a_tool_name_fails(self):
+        self.assertEqual(1, self.run_gate({"runs": [{"results": []}]}))
+
+    def test_self_reported_execution_failure_fails(self):
+        doc = sarif([], [])
+        doc["runs"][0]["invocations"] = [{"executionSuccessful": False}]
+        self.assertEqual(1, self.run_gate(doc))
+        doc["runs"][0]["invocations"] = [{"executionSuccessful": True}]
+        self.assertEqual(0, self.run_gate(doc))
+
+    def test_nan_threshold_is_refused(self):
+        self.assertEqual(1, self.run_gate(sarif([], []), "--fail-on-cvss", "nan", "--cvss-ceiling", "9.0"))
+        self.assertEqual(1, self.run_gate(sarif([], []), "--fail-on-cvss", "inf"))
+        self.assertEqual(1, self.run_gate(sarif([], []), "--fail-on-cvss", "-1"))
+
+    def test_nan_score_blocks_instead_of_passing(self):
+        rule_desc = {"id": "osv-1", "properties": {"security-severity": "NaN"}}
+        doc = sarif([result("osv-1", "warning")], [rule_desc])
+        self.assertEqual(1, self.run_gate(doc, "--fail-on-cvss", "9.0"))
+
+
+class SemgrepExceptionTests(unittest.TestCase):
+    """`semgrep:<rule>` exceptions in the policy overlay, same rules as the scanner's."""
+
+    RID = "rules.js-ts-dynamic-eval"
+
+    def run_gate(self, results, exceptions):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.sarif"
+            p.write_text(json.dumps(sarif(results, [rule(self.RID, "error")])), encoding="utf-8")
+            o = Path(td) / "policy.json"
+            o.write_text(json.dumps({"exceptions": exceptions}), encoding="utf-8")
+            return gate.main([str(p), "--fail-on", "error",
+                              "--policy", str(SECURITY / "policy.defaults.json"), "--policy-overlay", str(o)])
+
+    def exc(self, **extra):
+        return {"rule": "semgrep:js-ts-dynamic-eval", "paths": ["src/a.ts"],
+                "reason": "Reviewed sandboxed evaluator.", "expires": "2099-01-01", **extra}
+
+    def test_valid_exception_clears_the_finding(self):
+        self.assertEqual(0, self.run_gate([result(self.RID)], [self.exc()]))
+
+    def test_exception_covers_only_its_site_count(self):
+        self.assertEqual(1, self.run_gate([result(self.RID), result(self.RID)], [self.exc()]))
+        self.assertEqual(0, self.run_gate([result(self.RID), result(self.RID)], [self.exc(sites=2)]))
+
+    def test_expired_or_invalid_exception_is_not_applied(self):
+        self.assertEqual(1, self.run_gate([result(self.RID)], [self.exc(expires="2020-01-01")]))
+        self.assertEqual(1, self.run_gate([result(self.RID)], [self.exc(reason="short")]))
+
+    def test_exception_for_another_path_does_not_apply(self):
+        self.assertEqual(1, self.run_gate([result(self.RID)], [self.exc(paths=["src/other.ts"])]))
+
+    def test_scanner_rule_names_do_not_clear_semgrep(self):
+        self.assertEqual(1, self.run_gate([result(self.RID)], [self.exc(rule="DYNAMIC_CODE_EXECUTION")]))

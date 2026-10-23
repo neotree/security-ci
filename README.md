@@ -26,7 +26,7 @@ Everything else — the scanner, the rules, the installers, the indicators — l
 | Lives here | Lives in each repository |
 | --- | --- |
 | `scan_repo.py`, `run_project_checks.py`, `gate_sarif.py` | `security/policy.json` — its exceptions and thresholds |
-| Semgrep rules (6 local + 87 vendored community) | `security/gitleaks-ignore.txt` — its acknowledged leaks |
+| Semgrep rules (7 local + 87 vendored community) and the promoted-rule list | `security/gitleaks-ignore.txt` — its acknowledged leaks |
 | Gitleaks / OSV configuration, pinned installers | `.github/CODEOWNERS` |
 | Campaign indicators (`polinrider_iocs.json`) | Three ~15-line caller workflows |
 | The reusable workflows | |
@@ -87,7 +87,7 @@ nothing blocks until the checks are marked required.
 ## Working on this repository
 
 ```bash
-python3 -m unittest discover -s security/tests -t . -v   # 130 regression tests
+python3 -m unittest discover -s security/tests -t . -v   # 226 regression tests
 python3 security/scan_repo.py --root .                   # scan this repo with itself
 shellcheck --severity=warning security/*.sh
 $(./security/install_actionlint.sh) .github/workflows/*.yml templates/workflows/*.yml
