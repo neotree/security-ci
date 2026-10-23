@@ -7,6 +7,7 @@ after the trusted malware gate has inspected the PR as data.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -287,14 +288,107 @@ def artifact_pathspecs() -> list[str]:
     return sorted(f":!{t}" for t in tops if t and "*" not in t)
 
 
-def tracked_clean(repo: Path, env: dict[str, str], phase: str) -> None:
-    cmd = ["git", "diff", "--exit-code", "--stat", "--", ".", *artifact_pathspecs()]
-    proc = subprocess.run(cmd, cwd=repo, env=env, check=False)
+# The commit under test and its full file listing, both recorded BEFORE any project code
+# runs. Afterwards git is not consulted about content at all: every answer it gives can be
+# shaped by the code under test. `git add` hid a rewrite from `git diff`; so does
+# `update-index --assume-unchanged` or `--skip-worktree`, and a clean filter added to
+# .git/config can make altered content hash as the original. Each tracked file is instead
+# re-hashed here, from the bytes on disk, against the blob id recorded up front.
+BASELINE: str | None = None
+BASELINE_TREE: dict[str, tuple[str, str]] = {}
+
+
+def record_baseline(repo: Path, env: dict[str, str]) -> None:
+    global BASELINE, BASELINE_TREE
+    env = {**env, "GIT_NO_REPLACE_OBJECTS": "1"}
+    BASELINE = capture(["git", "rev-parse", "--verify", "HEAD^{commit}"], repo, env).strip()
+    if not BASELINE:
+        raise RuntimeError("Cannot establish the commit under test; refusing to run project code.")
+    proc = subprocess.run(["git", "ls-tree", "-r", "-z", "--full-tree", BASELINE], cwd=repo, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if proc.returncode != 0:
+        raise RuntimeError("Cannot list the commit under test; refusing to run project code.")
+    tree: dict[str, tuple[str, str]] = {}
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition(b"\t")
+        mode, kind, sha = meta.decode().split()
+        if kind == "blob":
+            tree[os.fsdecode(path)] = (mode, sha)
+    BASELINE_TREE = tree
+
+
+def _blob_id(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _excluded(rel: str) -> bool:
+    tops = {spec[2:] for spec in artifact_pathspecs()}
+    return rel.split("/", 1)[0] in tops
+
+
+def changed_files(repo: Path) -> list[str]:
+    changed: list[str] = []
+    for rel, (mode, sha) in BASELINE_TREE.items():
+        if _excluded(rel):
+            continue
+        path = repo / rel
+        try:
+            if mode == "120000":
+                if not path.is_symlink() or _blob_id(os.fsencode(os.readlink(path))) != sha:
+                    changed.append(rel)
+                continue
+            if path.is_symlink() or not path.is_file():
+                changed.append(rel)
+                continue
+            data = path.read_bytes()
+        except OSError:
+            changed.append(rel)
+            continue
+        # A CRLF working copy of an LF blob is checkout conversion, not a rewrite.
+        if _blob_id(data) != sha and _blob_id(data.replace(b"\r\n", b"\n")) != sha:
+            changed.append(rel)
+        elif (mode == "100755") != bool(path.stat().st_mode & 0o111):
+            changed.append(rel)
+    return changed
+
+
+def tracked_clean(repo: Path, env: dict[str, str], phase: str) -> None:
+    if BASELINE is None:
+        raise RuntimeError("Mutation guard used before the baseline commit was recorded.")
+    head = capture(["git", "rev-parse", "--verify", "HEAD^{commit}"], repo, env).strip()
+    if head != BASELINE:
         raise RuntimeError(
-            f"Tracked repository files changed during {phase}. CI project scripts must not "
-            "rewrite committed source/configuration."
+            f"HEAD moved from {BASELINE[:12]} to {head[:12]} during {phase}. CI project "
+            "scripts must not commit, reset or check out."
         )
+    changed = changed_files(repo)
+    if changed:
+        listed = ", ".join(changed[:20]) + (f" and {len(changed) - 20} more" if len(changed) > 20 else "")
+        raise RuntimeError(
+            f"Tracked repository files changed during {phase}: {listed}. CI project scripts "
+            "must not rewrite committed source/configuration."
+        )
+
+
+TEST_DIRS = {"tests", "test", "__tests__", "spec"}
+TEST_FILE = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$")
+
+
+def tests_present(project: Project) -> list[str]:
+    """Up to three test files/dirs in the project, outside dependencies and build output."""
+    found: list[str] = []
+    for current, dirs, files in os.walk(project.root):
+        dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", ".next", "dist", "build", "coverage"}]
+        rel = Path(current).relative_to(project.root)
+        for d in dirs:
+            if d in TEST_DIRS:
+                found.append(str(rel / d))
+        found.extend(str(rel / f) for f in files if TEST_FILE.search(f))
+        if len(found) >= 3:
+            break
+    return found[:3]
 
 
 def run_project(project: Project, repo: Path, env: dict[str, str]) -> None:
@@ -308,6 +402,15 @@ def run_project(project: Project, repo: Path, env: dict[str, str]) -> None:
         raise RuntimeError(f"{display}: required package.json script 'lint' is missing")
     if POLICY.get("require_typecheck_for_typescript", True) and ts_present(project) and "typecheck" not in scripts:
         raise RuntimeError(f"{display}: TypeScript detected but required package.json script 'typecheck' is missing")
+    # A test suite with no `test` script is skipped without a word, so a regression that
+    # the suite would catch merges green.
+    if POLICY.get("require_test_script_when_tests_present", True) and "test" not in scripts:
+        present = tests_present(project)
+        if present:
+            raise RuntimeError(
+                f"{display}: tests exist ({', '.join(present)}) but package.json has no 'test' "
+                "script, so CI would silently skip them. Add a `test` script that runs them."
+            )
 
     install_dependencies(project, env)
     tracked_clean(repo, env, "dependency installation")
@@ -339,6 +442,8 @@ def main() -> int:
     env = clean_env()
     try:
         projects = discover_projects(repo)
+        # Discovery only reads files; the baseline must exist before any project code runs.
+        record_baseline(repo, env)
         for project in projects:
             run_project(project, repo, env)
     except RuntimeError as e:

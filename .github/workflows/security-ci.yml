@@ -25,8 +25,14 @@ on:
         type: string
         default: security/gitleaks-ignore.txt
       enable-codeql:
+        description: >-
+          Run this pipeline's own CodeQL jobs. Off by default: CodeQL is enabled for every
+          Neotree repository by the organisation-level code scanning configuration, which
+          rejects SARIF from a second, advanced configuration - so running it here as well
+          fails the upload without adding coverage. Turn on only for a repository outside
+          the organisation configuration.
         type: boolean
-        default: true
+        default: false
       enable-dependency-review:
         type: boolean
         default: true
@@ -92,7 +98,9 @@ jobs:
       - name: Verify the caller pins workflow and scanner to the same commit
         # Dependabot updates `uses:` but not `security-ci-ref`, so a routine bump would
         # otherwise run a new workflow against an old scanner with nothing saying so.
-        run: python3 scanner/security/check_caller_pin.py repo
+        # --require-all: removing one of the three connectors (e.g. the malware gate)
+        # is itself a failure, not a quieter pipeline.
+        run: python3 scanner/security/check_caller_pin.py --require-all repo
       - name: Scanner regression tests
         working-directory: scanner
         run: python3 -m unittest discover -s security/tests -t . -v
@@ -210,16 +218,72 @@ jobs:
           SECURITY_POLICY_DEFAULTS: ${{ github.workspace }}/scanner/security/policy.defaults.json
           SECURITY_POLICY_OVERLAY: ${{ github.workspace }}/repo/${{ inputs.policy-overlay }}
         run: python3 scanner/security/run_project_checks.py --repo repo
+      # The post-build scan does NOT run here. Every lint/test/build script and every
+      # dependency above ran in this job with write access to the `scanner` checkout, so
+      # anything they left behind - a rewritten scan_repo.py, a relaxed policy - would
+      # judge its own output. The tree is handed to a fresh job on a clean runner instead.
+      - name: Hand the post-build tree to an isolated scan job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: post-build-tree
+          path: |
+            repo/
+            !repo/.git/
+            !repo/**/node_modules/
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: error
+
+  post-build-scan:
+    name: Post-Build Injection Scan
+    needs: [quality]
+    if: ${{ needs.quality.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - name: Download the post-build tree as inert data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: post-build-tree
+          path: built
+      - name: Checkout pinned scanner (fresh; never touched by project code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neotree/security-ci
+          ref: ${{ inputs.security-ci-ref }}
+          path: scanner
+          persist-credentials: false
+      # The overlay comes from a clean checkout of the commit under test, not from the
+      # post-build tree: a build step must not be able to relax the policy that judges it.
+      - name: Checkout policy overlay source (clean)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          sparse-checkout: |
+            security
+          sparse-checkout-cone-mode: true
       - name: Detect build-time/source injection after project scripts
         shell: bash
         env:
           OVERLAY: ${{ inputs.policy-overlay }}
         run: |
           set -Eeuo pipefail
-          args=(--root repo --policy scanner/security/policy.defaults.json
+          args=(--root built --policy scanner/security/policy.defaults.json
                 --iocs scanner/security/polinrider_iocs.json
                 --report reports/post-build-security-report.json)
-          if [ -f "repo/${OVERLAY}" ]; then args+=(--policy-overlay "repo/${OVERLAY}"); fi
+          if [ -f "source/${OVERLAY}" ]; then args+=(--policy-overlay "source/${OVERLAY}"); fi
           python3 scanner/security/scan_repo.py "${args[@]}"
       - name: Upload post-build scan report
         if: ${{ always() }}
@@ -354,10 +418,23 @@ jobs:
               --config /rules/semgrep-rules.yml \
               --config /rules/semgrep \
               --metrics off \
+              --disable-nosem \
               --sarif \
               --output /out/semgrep.sarif
-      - name: Block on ERROR-severity results only
-        run: python3 scanner/security/gate_sarif.py reports/semgrep.sarif --fail-on error --label Semgrep
+      # ERROR results block, and so do the reviewed WARNING rules listed in
+      # semgrep-blocking-rules.txt (injection, hardcoded secrets, XXE, SSRF, TLS bypass).
+      # --disable-nosem above means an inline `nosemgrep` comment in the repository under
+      # test cannot silence any of them; accepted risk goes through the policy overlay.
+      # Accepted risk for Semgrep lives in the same reviewed, dated policy files as the
+      # custom scanner's (`"rule": "semgrep:<rule-id>"`), never in the shared rules.
+      - name: Block on ERROR results and promoted high-confidence rules
+        env:
+          OVERLAY: ${{ inputs.policy-overlay }}
+        run: |
+          python3 scanner/security/gate_sarif.py reports/semgrep.sarif --fail-on error --label Semgrep \
+            --block-rules scanner/security/semgrep-blocking-rules.txt \
+            --policy scanner/security/policy.defaults.json \
+            --policy-overlay "repo/${OVERLAY}"
       - name: Upload Semgrep results to code scanning
         if: ${{ always() && inputs.upload-sarif && github.event.pull_request.head.repo.fork != true }}
         uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
@@ -441,7 +518,10 @@ jobs:
         uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
         continue-on-error: true
         with:
+          # --config: the trusted, ignore-free config from security-ci. Without it OSV
+          # reads any osv-scanner.toml a pull request adds, which can ignore packages.
           scan-args: |-
+            --config=.security-scanner/security/osv-scanner.toml
             --format=json
             --output=osv-results.json
             --include-git-root
@@ -466,9 +546,12 @@ jobs:
             --gh-annotations=true
             --fail-on-vuln=false
       - name: Block on vulnerabilities at or above the CVSS threshold
+        # Via env, never interpolated into the script: it is a caller-supplied string.
+        env:
+          THRESHOLD: ${{ inputs.osv-cvss-threshold }}
         run: |
           python3 .security-scanner/security/gate_sarif.py osv-results.sarif \
-            --fail-on-cvss "${{ inputs.osv-cvss-threshold }}" --label OSV
+            --fail-on-cvss "${THRESHOLD}" --cvss-ceiling 9.0 --label OSV
       - name: Upload OSV report
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -518,13 +601,14 @@ jobs:
   merge-gate:
     name: Merge Gate
     if: ${{ always() }}
-    needs: [static-policy, quality, gitleaks, semgrep, dependency-review, osv, codeql]
+    needs: [static-policy, quality, post-build-scan, gitleaks, semgrep, dependency-review, osv, codeql]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     env:
       STATIC_POLICY: ${{ needs.static-policy.result }}
       QUALITY: ${{ needs.quality.result }}
+      POST_BUILD: ${{ needs.post-build-scan.result }}
       GITLEAKS: ${{ needs.gitleaks.result }}
       SEMGREP: ${{ needs.semgrep.result }}
       DEP_REVIEW: ${{ needs.dependency-review.result }}
@@ -553,6 +637,7 @@ jobs:
           for item in \
             "static-policy=${STATIC_POLICY}" \
             "quality=${QUALITY}" \
+            "post-build-scan=${POST_BUILD}" \
             "gitleaks=${GITLEAKS}" \
             "semgrep=${SEMGREP}" \
             "dependency-review=${DEP_REVIEW}" \
@@ -566,6 +651,14 @@ jobs:
               *) status=1 ;;
             esac
           done
+
+          # "skipped" is a pass only when there was nothing to scan. Once the project
+          # checks have run, the post-build scan must actually have run and passed.
+          if [ "${QUALITY}" = "success" ] && [ "${POST_BUILD}" != "success" ]; then
+            emit ""
+            emit "Project checks ran but the post-build injection scan did not pass."
+            status=1
+          fi
 
           if [ "${status}" -ne 0 ]; then
             emit ""

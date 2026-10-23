@@ -28,9 +28,10 @@ jobs:
     with:
       security-ci-ref: 0000000000000000000000000000000000000000
       node-version: "22"
-      # Private repositories on the Free plan have no code scanning:
+      # CodeQL is not run here: the organisation-level code scanning configuration runs it
+      # on every repository, and a second configuration would only fail its upload.
+      # Private repositories on the Free plan have no code scanning at all:
       # upload-sarif: false
-      # enable-codeql: false
       # Hosts the install/build needs beyond the npm registry (e.g. Prisma engines,
       # Google Fonts for next/font). Keep the folded `>-`: the list must reach
       # harden-runner space-separated, and a `|` block silently allows nothing.

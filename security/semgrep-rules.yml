@@ -9,15 +9,12 @@ rules:
     languages: [javascript, typescript]
     severity: ERROR
     message: Dynamic code execution is forbidden.
+    # No path exclusions here: this file is shared by every repository and has no expiry.
+    # A repository's accepted risk goes in its own security/policy.json as
+    # {"rule": "semgrep:js-ts-dynamic-eval", ...} with a reason and an expiry date.
     pattern-either:
       - pattern: eval(...)
       - pattern: new Function(...)
-    paths:
-      exclude:
-        # Mirrors the reviewed, expiring exception in security/policy.json.
-        # Remove from BOTH places when the sandboxed evaluator lands.
-        # Leading slash anchors to the scan root (Semgrepignore v2 semantics).
-        - "/app/(ops)/conditional-exp/_eval.ts"
 
   - id: js-ts-unsafe-raw-sql-template
     languages: [javascript, typescript]
@@ -31,6 +28,46 @@ rules:
       - pattern: $DB.$executeRawUnsafe(...)
       - pattern: $DB.query($A + $B)
       - pattern: $DB.execute($A + $B)
+
+  # Request data reaching a SQL string. The template rule above only sees interpolation
+  # written inline in the call; this follows the value through local variables, string
+  # concatenation and helper expressions within a handler, e.g.
+  #   const month = req.query.month; pool.query(`... = ${month}`)
+  - id: js-ts-request-data-in-sql
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Request data flows into a SQL string. Pass it as a bind parameter ($1, ?) instead
+      of building the query text from it.
+    mode: taint
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.query
+              - pattern: $REQ.params
+              - pattern: $REQ.body
+              - pattern: $REQ.headers
+              - pattern: $REQ.cookies
+              - pattern: $REQ.get(...)
+              - pattern: $REQ.header(...)
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^(req|request)$
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: parseInt(...)
+          - pattern: parseFloat(...)
+          - pattern: Number(...)
+          - pattern: Boolean(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.query($SQL, ...)
+              - pattern: $DB.execute($SQL, ...)
+              - pattern: $DB.raw($SQL, ...)
+              - pattern: $DB.$queryRawUnsafe($SQL, ...)
+              - pattern: $DB.$executeRawUnsafe($SQL, ...)
+          - focus-metavariable: $SQL
 
   - id: js-ts-child-process-exec
     languages: [javascript, typescript]

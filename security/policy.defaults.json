@@ -44,6 +44,7 @@
   ],
   "require_lint_script": true,
   "require_typecheck_for_typescript": true,
+  "require_test_script_when_tests_present": true,
   "run_tests_if_present": true,
   "run_build_if_present": true,
   "sensitive_review_label": "security-reviewed:<head-sha7>",

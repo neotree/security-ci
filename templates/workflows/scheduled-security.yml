@@ -17,3 +17,6 @@ jobs:
       packages: read
     with:
       security-ci-ref: 0000000000000000000000000000000000000000
+      # Nightly OSV re-check of dependencies already on the default branch. Tighten as the
+      # backlog clears (9.0 -> 7.0 -> 4.0); it may never be loosened above the default.
+      # osv-cvss-threshold: "7.0"
