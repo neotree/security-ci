@@ -119,7 +119,7 @@ jobs:
           python3 scanner/security/scan_repo.py "${args[@]}"
       - name: Upload findings to code scanning
         if: ${{ always() && inputs.upload-sarif && github.event.pull_request.head.repo.fork != true }}
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: reports/security-report.sarif
           category: repo-policy-scanner
@@ -437,7 +437,7 @@ jobs:
             --policy-overlay "repo/${OVERLAY}"
       - name: Upload Semgrep results to code scanning
         if: ${{ always() && inputs.upload-sarif && github.event.pull_request.head.repo.fork != true }}
-        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: reports/semgrep.sarif
           category: semgrep
