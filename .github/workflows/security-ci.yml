@@ -538,7 +538,7 @@ jobs:
         # --fail-on-vuln=false on purpose: it fails on ANY vulnerability at any severity,
         # which no repository with a real dependency tree can hold. The severity gate is
         # the next step.
-        uses: google/osv-scanner-action/osv-reporter-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+        uses: google/osv-scanner-action/osv-reporter-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
         with:
           scan-args: |-
             --output=osv-results.sarif
