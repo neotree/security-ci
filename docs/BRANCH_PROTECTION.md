@@ -19,9 +19,19 @@ Configure the default branch (`master`) with:
 4. Dismiss stale approvals when new commits are pushed.
 5. Require approval of the most recent reviewable push.
 6. Require conversation resolution.
-7. Require these status checks (see the merge-queue note below):
-   - **PR Malware Gate**
-   - **Merge Gate**
+7. Require these status checks (see the merge-queue note below), with **GitHub Actions** as the source:
+   - **`gate / PR Malware Gate`**
+   - **`security / Merge Gate`**
+
+   Use these exact names. A reusable workflow's check is named `<caller job id> / <job name>`,
+   and the templates call the jobs `gate` and `security`. Requiring the bare `PR Malware Gate`
+   or `Merge Gate` waits for a check that never reports, so every pull request is blocked. If a
+   repository renames those caller jobs, copy the names from a pull request's checks list.
+
+   The code-scanning checks (`CodeQL`, `Semgrep OSS`, the repository scanner's SARIF upload)
+   are **not** a substitute. They only see what is uploaded as SARIF: a known-critical
+   dependency (OSV, Dependency Review), an unreviewed change to a protected security file, or a
+   failing build all pass them. Only the two gates above cover every job.
 8. Block force pushes and branch deletion.
 9. Do not allow bypass of the ruleset except a tightly controlled break-glass role.
 10. Enable the dependency graph, Dependabot alerts/security updates, secret scanning and push protection where your GitHub plan supports them.
@@ -49,7 +59,7 @@ every deployment branch.
 | Setting | Now | Needs to be | Why |
 | --- | --- | --- | --- |
 | `require_code_owner_review` | `false` | **`true`** | Until this is on, `.github/CODEOWNERS` has no effect at all and security-control changes need no security review |
-| *required status checks* | *rule absent* | **add `PR Malware Gate` + `Merge Gate`** | Without it every job reports but nothing blocks; the pipeline is advisory only |
+| *required status checks* | *rule absent* | **add `gate / PR Malware Gate` + `security / Merge Gate`** | Without it every job reports but nothing blocks; the pipeline is advisory only |
 | `require_last_push_approval` | `false` | `true` | Stops a final push landing after approval |
 | `required_review_thread_resolution` | `false` | `true` | Unresolved review comments cannot be merged past |
 
@@ -72,10 +82,25 @@ If you enable GitHub Merge Queue, requiring `PR Malware Gate` as a merge-queue s
 
 So:
 
-- **Require `PR Malware Gate` for pull requests.** It is a pre-queue gate: a PR cannot be approved or queued without it.
-- **Require only `Merge Gate` inside the merge queue.** `Security CI` handles `merge_group` and re-runs the full scanner, secret scan, SAST, dependency and build checks against the merged result.
+- **Require `gate / PR Malware Gate` for pull requests.** It is a pre-queue gate: a PR cannot be approved or queued without it.
+- **Require only `security / Merge Gate` inside the merge queue.** `Security CI` handles `merge_group` and re-runs the full scanner, secret scan, SAST, dependency and build checks against the merged result.
 
 If you do not use a merge queue, require both checks and additionally require branches to be up to date before merging.
+
+## Draft pull requests
+
+`Security CI` runs no scans on a draft pull request, and `security / Merge Gate` **fails** on
+drafts on purpose, saying the scans did not run. Marking the pull request *ready for review*
+starts a fresh run with every scan.
+
+It must fail rather than pass or skip. GitHub counts a skipped required check as passing, and
+while a later run's failed jobs are being re-run it shows the newest *finished* Merge Gate on
+the same commit. When the draft-time gate passed, a pull request opened as a draft could be
+approved, have its failed jobs re-run, and be merged while that stale green result was showing.
+
+The gate also fails if any scan that should have run was skipped. Only quality and post-build
+(when `enable-quality` is off), Dependency Review (outside pull requests, or when disabled) and
+CodeQL (when disabled) may be skipped.
 
 ## Security-control changes
 

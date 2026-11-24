@@ -352,11 +352,12 @@ jobs:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: block
-          # registry-1.docker.io only serves the manifest; it 307s the layer blobs to one
-          # of Docker Hub's two CDNs and picks between them per request. Both must be
-          # allowed - listing only one makes `docker pull` fail deterministically whenever
-          # the redirect lands on the other, which is easy to misread as rate limiting
-          # because the manifest fetch itself succeeds.
+          # registry-1.docker.io only serves the manifest; it 307s the image config and
+          # layer blobs to one of Docker Hub's blob backends and picks between them per
+          # request: the two CDNs, or the S3 bucket directly. All must be allowed - missing
+          # one makes `docker pull` fail whenever the redirect lands on it ("dial tcp ...:443:
+          # i/o timeout" after the manifest succeeded), which is easy to misread as rate
+          # limiting. The S3 host was seen denied in harden-runner's report on 2026-11-23/24.
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -365,6 +366,7 @@ jobs:
             registry-1.docker.io:443
             production.cloudflare.docker.com:443
             production.cloudfront.docker.com:443
+            docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:443
       - name: Checkout repository under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -614,6 +616,11 @@ jobs:
       DEP_REVIEW: ${{ needs.dependency-review.result }}
       OSV: ${{ needs.osv.result }}
       CODEQL: ${{ needs.codeql.result }}
+      EVENT_NAME: ${{ github.event_name }}
+      IS_DRAFT: ${{ github.event.pull_request.draft == true }}
+      ENABLE_QUALITY: ${{ inputs.enable-quality }}
+      ENABLE_DEPENDENCY_REVIEW: ${{ inputs.enable-dependency-review }}
+      ENABLE_CODEQL: ${{ inputs.enable-codeql }}
     steps:
       - name: Require every enabled security job to pass
         shell: bash
@@ -629,9 +636,38 @@ jobs:
             printf '%s\n' "$1" >> "${SUMMARY}"
           }
 
-          status=0
           emit "## Merge Gate"
           emit ""
+
+          # A draft runs no scans, so there is nothing this gate could vouch for. It must FAIL
+          # rather than pass or skip: GitHub counts a skipped required check as passing, and
+          # while a later run's jobs are re-run, GitHub falls back to the newest finished
+          # Merge Gate on the same commit. A green draft-time gate was therefore a bypass:
+          # open as draft, mark ready, re-run the failed jobs, merge while they are queued.
+          if [ "${IS_DRAFT}" = "true" ]; then
+            emit "Draft pull request: the security scans do not run on drafts, so this gate cannot pass."
+            emit "Mark the pull request ready for review to run them."
+            echo "::error::Draft pull request: security scans were not run. Mark it ready for review to run them."
+            exit 1
+          fi
+
+          # A job may be skipped only where this run's configuration says it should not run.
+          # Any other skip (a new or edited `if:`, an upstream failure) means a scan did not
+          # happen, and that must not read as a pass.
+          skip_expected() {
+            case "$1" in
+              quality) [ "${ENABLE_QUALITY}" != "true" ] ;;
+              # Runs only after the project checks pass; a failed or skipped quality job is
+              # judged on its own line.
+              post-build-scan) [ "${QUALITY}" != "success" ] ;;
+              dependency-review) [ "${EVENT_NAME}" != "pull_request" ] || [ "${ENABLE_DEPENDENCY_REVIEW}" != "true" ] ;;
+              codeql) [ "${ENABLE_CODEQL}" != "true" ] ;;
+              # static-policy, gitleaks, semgrep and osv always run on a non-draft event.
+              *) return 1 ;;
+            esac
+          }
+
+          status=0
           emit "| Job | Result |"
           emit "| --- | --- |"
           for item in \
@@ -645,20 +681,22 @@ jobs:
             "codeql=${CODEQL}"; do
             name="${item%%=*}"
             result="${item#*=}"
-            emit "| ${name} | ${result} |"
             case "${result}" in
-              success|skipped) ;;
-              *) status=1 ;;
+              success) emit "| ${name} | ${result} |" ;;
+              skipped)
+                if skip_expected "${name}"; then
+                  emit "| ${name} | skipped (not enabled for this run) |"
+                else
+                  emit "| ${name} | **skipped unexpectedly: this scan did not run** |"
+                  status=1
+                fi
+                ;;
+              *)
+                emit "| ${name} | **${result}** |"
+                status=1
+                ;;
             esac
           done
-
-          # "skipped" is a pass only when there was nothing to scan. Once the project
-          # checks have run, the post-build scan must actually have run and passed.
-          if [ "${QUALITY}" = "success" ] && [ "${POST_BUILD}" != "success" ]; then
-            emit ""
-            emit "Project checks ran but the post-build injection scan did not pass."
-            status=1
-          fi
 
           if [ "${status}" -ne 0 ]; then
             emit ""

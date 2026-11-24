@@ -171,7 +171,10 @@ On the default-branch ruleset:
 
 - require a pull request, at least one approving review
 - **`require_code_owner_review: true`** — without this, CODEOWNERS does nothing at all
-- required status checks: **`PR Malware Gate`** and **`Merge Gate`**
+- required status checks: **`gate / PR Malware Gate`** and **`security / Merge Gate`**, exactly as
+  shown on a pull request (`<caller job id> / <job name>`; the bare names never report and would
+  block every PR). The code-scanning checks are not a substitute; see
+  [BRANCH_PROTECTION.md](BRANCH_PROTECTION.md)
 - dismiss stale approvals on push, require last-push approval, require thread resolution
 - block force-pushes and deletion — this is the control that stops the "commit twin"
   technique, and it matters as much as any scanner
